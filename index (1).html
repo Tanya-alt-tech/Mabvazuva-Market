@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mabvazuva Market</title>
+<meta name="description" content="The business and services directory for Mabvazuva. Find a trusted neighbour for anything, and chat on WhatsApp in one tap.">
+<meta name="theme-color" content="#123A2E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Young+Serif&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<a class="skip" href="#app">Skip to content</a>
+<div id="ribbon"></div>
+
+<header class="top">
+  <div class="wrap top-in">
+    <a class="brand" href="#/" aria-label="Mabvazuva Market home">
+      <span class="brand-sun" aria-hidden="true"></span>
+      <span class="brand-name">Mabvazuva Market</span>
+    </a>
+    <nav class="top-nav" aria-label="Main">
+      <a href="#/browse" data-nav="browse">Browse</a>
+      <a href="#/requests" data-nav="requests">Requests</a>
+      <a href="#/deals" data-nav="deals">Deals and events</a>
+      <a href="#/pricing" data-nav="pricing">Pricing</a>
+      <a href="#/account" data-nav="account" id="nav-account">Sign in</a>
+      <a class="btn btn-brass btn-small" href="#/join">List your business</a>
+    </nav>
+  </div>
+</header>
+
+<main id="app" tabindex="-1"><p class="loading">Opening the gate…</p></main>
+
+<footer class="foot">
+  <div class="wrap foot-in">
+    <p class="foot-line">By Mabvazuva, for Mabvazuva.</p>
+    <nav aria-label="Footer">
+      <a href="#/pricing">Pricing</a>
+      <a href="#/join">List your business</a>
+      <a href="#/dashboard">Business dashboard</a>
+      <a href="#/account">Account</a>
+      <a href="#/admin" id="foot-admin" hidden>Admin</a>
+    </nav>
+  </div>
+</footer>
+
+<nav class="tabs" aria-label="Quick">
+  <a href="#/" data-nav="home">Home</a>
+  <a href="#/browse" data-nav="browse">Browse</a>
+  <a href="#/requests" data-nav="requests">Requests</a>
+  <a href="#/deals" data-nav="deals">Deals</a>
+  <a href="#/join" data-nav="join">List</a>
+</nav>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

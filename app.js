@@ -1,0 +1,771 @@
+/* Mabvazuva Market. Settings live in data.js; you should not need to edit this file. */
+(function () {
+'use strict';
+
+const C = window.MM_CONFIG, CATS = window.MM_CATEGORIES, SAMPLE = window.MM_SAMPLE;
+const LIVE = !!(C.supabaseUrl && C.supabaseKey);
+const sb = LIVE && window.supabase ? window.supabase.createClient(C.supabaseUrl, C.supabaseKey) : null;
+
+const $ = (s, r) => (r || document).querySelector(s);
+const app = $('#app');
+const DAY = 864e5;
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const catName = id => (CATS.find(c => c.id === id) || { name: 'Everything else' }).name;
+const digits = n => { let d = String(n || '').replace(/\D/g, ''); if (d.length === 10 && d[0] === '0') d = '263' + d.slice(1); return d; };
+const waLink = (n, text) => 'https://wa.me/' + digits(n) + (text ? '?text=' + encodeURIComponent(text) : '');
+const siteUrl = () => location.href.split('#')[0];
+const uid = () => 'x' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const plural = (n, one, many) => n + ' ' + (n === 1 ? one : many);
+const ago = iso => {
+  const d = Math.floor((Date.now() - new Date(iso).getTime()) / DAY);
+  if (d < 1) return 'today'; if (d < 2) return 'yesterday'; if (d < 14) return d + ' days ago';
+  if (d < 60) return Math.floor(d / 7) + ' weeks ago'; return Math.floor(d / 30) + ' months ago';
+};
+
+let DB = { all: [], reviews: [], requests: [], events: [], counts: {} };
+let ME = { user: null, admin: false };
+
+/* ---------------- storage helpers ---------------- */
+const ls = {
+  get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* storage full or blocked */ } },
+  del(k) { try { localStorage.removeItem(k); } catch (e) { /* ignore */ } }
+};
+
+/* ---------------- preview backend (no database connected) ---------------- */
+const PKEY = 'mm_preview_v1';
+let S = null;
+function seed() {
+  const now = Date.now(), iso = d => new Date(now - d * DAY).toISOString();
+  const s = { user: null, biz: [], reviews: [], requests: [], events: [], hits: {} };
+  SAMPLE.businesses.forEach(b => {
+    const o = Object.assign({}, b, { owner: 'sample', status: 'approved', requested_plan: b.plan, photos: [], created_at: iso(b.daysAgo) });
+    delete o.reviews; delete o.hits; delete o.daysAgo;
+    s.biz.push(o);
+    s.hits[b.id] = { view: b.hits.view.slice(), wa: b.hits.wa.slice() };
+    b.reviews.forEach(r => s.reviews.push({ id: uid(), business_id: b.id, name: r.name, stars: r.stars, body: r.body, created_at: iso(r.daysAgo) }));
+  });
+  s.reviews.sort((a, b) => a.created_at < b.created_at ? 1 : -1);
+  s.requests = SAMPLE.requests.map(r => Object.assign({}, r, { wa: '', created_at: iso(r.daysAgo) }));
+  s.events = SAMPLE.events.map(e => Object.assign({}, e));
+  return s;
+}
+const persist = () => ls.set(PKEY, S);
+const local = {
+  async session() { ME.user = S.user; ME.admin = !!S.user; },
+  async load() {
+    DB.all = S.biz.slice(); DB.reviews = S.reviews.slice(); DB.events = S.events.slice();
+    DB.requests = S.requests.map(r => { const c = Object.assign({}, r); delete c.wa; return c; });
+    DB.counts = {}; S.biz.forEach(b => { DB.counts[b.id] = (S.hits[b.id] || { wa: [0, 0, 0, 0] }).wa[3]; });
+  },
+  async signUp(email) { S.user = { id: 'local', email }; persist(); await this.session(); return true; },
+  async signIn(email) { S.user = { id: 'local', email }; persist(); await this.session(); },
+  async signOut() { S.user = null; persist(); await this.session(); },
+  async createBiz(o) {
+    const b = Object.assign({ id: uid(), owner: 'local', plan: 'starter', status: 'pending', paid: false, verified: false, featured: false, photos: [], prices: [], deal: '', created_at: new Date().toISOString() }, o);
+    S.biz.unshift(b); persist(); return b;
+  },
+  async updateBiz(id, p) { Object.assign(S.biz.find(b => b.id === id), p); persist(); },
+  async deleteBiz(id) { S.biz = S.biz.filter(b => b.id !== id); persist(); },
+  async addReview(o) { S.reviews.unshift(Object.assign({ id: uid(), created_at: new Date().toISOString() }, o)); persist(); },
+  async deleteReview(id) { S.reviews = S.reviews.filter(r => r.id !== id); persist(); },
+  async addRequest(o) { S.requests.unshift(Object.assign({ id: uid(), replies: 0, created_at: new Date().toISOString() }, o)); persist(); },
+  async requestContact(id) {
+    if (!ME.user) return { denied: true };
+    const r = S.requests.find(x => x.id === id); r.replies++; persist(); return { wa: r.wa || '' };
+  },
+  async deleteRequest(id) { S.requests = S.requests.filter(r => r.id !== id); persist(); },
+  async hit(id, kind) { const h = S.hits[id] || (S.hits[id] = { view: [0, 0, 0, 0], wa: [0, 0, 0, 0] }); h[kind][3]++; persist(); },
+  async stats(id) { return S.hits[id] || { view: [0, 0, 0, 0], wa: [0, 0, 0, 0] }; },
+  async upload(id, blob) { return new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = rej; fr.readAsDataURL(blob); }); },
+  async addEvent(o) { S.events.push(Object.assign({ id: uid() }, o)); persist(); },
+  async deleteEvent(id) { S.events = S.events.filter(e => e.id !== id); persist(); }
+};
+
+/* ---------------- live backend (Supabase) ---------------- */
+const ok = res => { if (res.error) throw new Error(res.error.message || 'Something went wrong'); return res.data; };
+const live = {
+  async session() {
+    const { data } = await sb.auth.getSession();
+    const u = data && data.session && data.session.user;
+    ME.user = u ? { id: u.id, email: u.email } : null; ME.admin = false;
+    if (u) { const r = await sb.rpc('is_admin'); ME.admin = !r.error && r.data === true; }
+  },
+  async load() {
+    const [b, r, q, e, c] = await Promise.all([
+      sb.from('businesses').select('*').order('created_at', { ascending: false }),
+      sb.from('reviews').select('*').order('created_at', { ascending: false }),
+      sb.from('requests').select('*').order('created_at', { ascending: false }),
+      sb.from('events').select('*').order('created_at', { ascending: true }),
+      sb.rpc('public_counts')
+    ]);
+    DB.all = ok(b); DB.reviews = ok(r); DB.requests = ok(q); DB.events = ok(e);
+    DB.counts = {}; (ok(c) || []).forEach(x => { DB.counts[x.business_id] = Number(x.contacts); });
+  },
+  async signUp(email, pw) { const d = ok(await sb.auth.signUp({ email, password: pw })); await this.session(); return !!(d && d.session); },
+  async signIn(email, pw) { ok(await sb.auth.signInWithPassword({ email, password: pw })); await this.session(); },
+  async signOut() { await sb.auth.signOut(); await this.session(); },
+  async createBiz(o) { return ok(await sb.from('businesses').insert(o).select().single()); },
+  async updateBiz(id, p) { ok(await sb.from('businesses').update(p).eq('id', id)); },
+  async deleteBiz(id) { ok(await sb.from('businesses').delete().eq('id', id)); },
+  async addReview(o) { ok(await sb.from('reviews').insert(o)); },
+  async deleteReview(id) { ok(await sb.from('reviews').delete().eq('id', id)); },
+  async addRequest(o) { ok(await sb.rpc('post_request', { p_need: o.need, p_when: o.when_text, p_name: o.name, p_cat: o.cat, p_wa: o.wa })); },
+  async requestContact(id) { const d = ok(await sb.rpc('request_contact', { p_id: id })); return d === null ? { denied: true } : { wa: d }; },
+  async deleteRequest(id) { ok(await sb.from('requests').delete().eq('id', id)); },
+  async hit(id, kind) { await sb.from('hits').insert({ business_id: id, kind }); },
+  async stats(id) {
+    const rows = ok(await sb.rpc('biz_stats', { p_id: id })) || [];
+    const o = { view: [0, 0, 0, 0], wa: [0, 0, 0, 0] };
+    rows.forEach(r => { if (r.wk >= 0 && r.wk < 4 && o[r.k]) o[r.k][3 - r.wk] = Number(r.n); });
+    return o;
+  },
+  async upload(id, blob) {
+    const path = id + '/' + Date.now() + '.jpg';
+    ok(await sb.storage.from('photos').upload(path, blob, { contentType: 'image/jpeg' }));
+    return sb.storage.from('photos').getPublicUrl(path).data.publicUrl;
+  },
+  async addEvent(o) { ok(await sb.from('events').insert(o)); },
+  async deleteEvent(id) { ok(await sb.from('events').delete().eq('id', id)); }
+};
+const api = LIVE ? live : local;
+
+/* ---------------- derived data ---------------- */
+const RANK = { premium: 0, growth: 1, starter: 2 };
+const reviewsOf = b => b.plan === 'starter' ? [] : DB.reviews.filter(r => r.business_id === b.id);
+const rating = b => { const r = reviewsOf(b); return r.length ? r.reduce((a, x) => a + x.stars, 0) / r.length : null; };
+const contacts = b => DB.counts[b.id] || 0;
+const isNew = b => Date.now() - new Date(b.created_at).getTime() < 14 * DAY;
+const byId = id => DB.all.find(b => b.id === id);
+const mine = () => ME.user ? DB.all.filter(b => b.owner === ME.user.id) : [];
+function approved() {
+  return DB.all.filter(b => b.status === 'approved').sort((a, b) =>
+    RANK[a.plan] - RANK[b.plan] || (rating(b) || 0) - (rating(a) || 0) || contacts(b) - contacts(a) || a.name.localeCompare(b.name));
+}
+const payingCount = () => DB.all.filter(b => b.status === 'approved' && b.plan !== 'starter' && b.paid).length;
+const foundingLeft = () => Math.max(0, C.foundingSpots - payingCount());
+const priceNow = plan => foundingLeft() > 0 ? C.plans[plan].founding : C.plans[plan].price;
+const featuredList = () => approved().filter(b => b.featured && b.plan === 'premium').slice(0, C.featuredSlots);
+
+/* ---------------- small pieces ---------------- */
+let toastTimer;
+function toast(msg) {
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 4200);
+}
+const mono = name => name.replace(/[^A-Za-z0-9 ]/g, '').split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0].toUpperCase()).join('');
+const plaque = (b, cls) => b.photos && b.photos.length
+  ? `<span class="plaque ${cls || ''}"><img src="${esc(b.photos[0])}" alt="" loading="lazy"></span>`
+  : `<span class="plaque ${cls || ''}" aria-hidden="true">${esc(mono(b.name))}</span>`;
+const tick = b => b.verified ? '<span class="tick" title="Verified Mabvazuva resident">Verified resident</span>' : '';
+const starText = b => { const r = rating(b); return r ? `<span class="stars">★ ${r.toFixed(1)}</span> from ${plural(reviewsOf(b).length, 'review', 'reviews')}` : ''; };
+function metaLine(b) {
+  const bits = [starText(b)];
+  if (contacts(b)) bits.push(`${plural(contacts(b), 'neighbour', 'neighbours')} made contact this week`);
+  return bits.filter(Boolean).join('<span class="sep"></span>');
+}
+const row = b => `
+  <a class="row" href="#/b/${esc(b.id)}">
+    ${plaque(b)}
+    <span class="row-main">
+      <span class="row-name">${esc(b.name)} ${tick(b)} ${isNew(b) ? '<span class="new">New</span>' : ''}</span>
+      <span class="row-tag">${esc(b.tagline)}</span>
+      <span class="row-meta">${esc(catName(b.cat))}${metaLine(b) ? '<span class="sep"></span>' + metaLine(b) : ''}</span>
+    </span>
+  </a>`;
+const head = (title, link, label) => `<div class="sec-head"><h2>${title}</h2>${link ? `<a href="${link}">${label}</a>` : ''}</div>`;
+const catOptions = sel => CATS.map(c => `<option value="${c.id}"${c.id === sel ? ' selected' : ''}>${esc(c.name)}</option>`).join('');
+const field = (label, inner, hint) => `<label class="field"><span class="field-label">${label}</span>${inner}${hint ? `<span class="hint">${hint}</span>` : ''}</label>`;
+const val = (fd, k) => String(fd.get(k) || '').trim();
+const foundingNote = () => foundingLeft() > 0
+  ? `<p class="founding">Founding-member prices are open to the first ${C.foundingSpots} paying businesses. ${plural(foundingLeft(), 'place is', 'places are')} left.</p>` : '';
+
+/* ---------------- pages ---------------- */
+function home() {
+  const list = approved(), feat = featuredList();
+  const fresh = list.filter(isNew).slice(0, 4);
+  const deals = list.filter(b => b.deal && b.plan !== 'starter').slice(0, 3);
+  const revs = DB.reviews.filter(r => { const b = byId(r.business_id); return b && b.status === 'approved' && b.plan !== 'starter'; }).slice(0, 3);
+  const totalContacts = list.reduce((a, b) => a + contacts(b), 0);
+  const counts = {}; list.forEach(b => { counts[b.cat] = (counts[b.cat] || 0) + 1; });
+
+  return `
+  <section class="hero">
+    <div class="sun" aria-hidden="true"></div>
+    <div class="wrap hero-in">
+      <h1>Everything you need is already inside the gate.</h1>
+      <p class="hero-sub">${list.length ? `${plural(list.length, 'Mabvazuva business', 'Mabvazuva businesses')}, from piano lessons to plumbing.` : 'The directory of Mabvazuva businesses, from piano lessons to plumbing.'} Find one, tap once, chat on WhatsApp.</p>
+      <form class="search" data-form="search" role="search">
+        <label class="sr" for="q">What do you need today?</label>
+        <input id="q" name="q" type="search" placeholder="What do you need today?" autocomplete="off">
+        <button class="btn btn-brass" type="submit">Search</button>
+      </form>
+      <p class="quick">${window.MM_QUICK.map(q => `<a href="#/browse?q=${encodeURIComponent(q)}">${esc(q)}</a>`).join('')}</p>
+    </div>
+  </section>
+
+  <div class="wrap">
+    ${totalContacts ? `<p class="pulse">${plural(totalContacts, 'neighbour', 'neighbours')} contacted a Mabvazuva business through this site in the last 7 days.</p>` : ''}
+
+    <section class="sec">
+      ${head('Browse by what you need', '#/browse', 'See everything')}
+      <ul class="cats">${CATS.map(c => `<li><a href="#/browse?cat=${c.id}"><span>${esc(c.name)}</span><span class="count">${counts[c.id] || 0}</span></a></li>`).join('')}</ul>
+    </section>
+
+    ${feat.length ? `<section class="sec">
+      ${head('Featured in Mabvazuva')}
+      <div class="feat">${feat.map(b => `
+        <a class="feat-card" href="#/b/${esc(b.id)}">
+          ${plaque(b, 'plaque-lg')}
+          <span class="feat-name">${esc(b.name)}</span>
+          <span class="feat-tag">${esc(b.tagline)}</span>
+          <span class="feat-meta">${tick(b)} ${starText(b)}</span>
+        </a>`).join('')}</div>
+    </section>` : ''}
+
+    ${!list.length ? `<section class="sec empty">
+      <h2>The directory opens with its first listing.</h2>
+      <p>Run a business in Mabvazuva? Be the name everyone sees first.</p>
+      <a class="btn btn-green" href="#/join">List your business free</a>
+    </section>` : ''}
+
+    ${fresh.length ? `<section class="sec">${head('New this week', '#/browse', 'All businesses')}<div class="rows">${fresh.map(row).join('')}</div></section>` : ''}
+
+    ${deals.length ? `<section class="sec">${head('Deals from your neighbours', '#/deals', 'All deals and events')}
+      <div class="deals">${deals.map(dealCard).join('')}</div></section>` : ''}
+
+    ${revs.length ? `<section class="sec">${head('What neighbours are saying')}
+      <div class="quotes">${revs.map(r => { const b = byId(r.business_id); return `
+        <figure class="quote"><blockquote>${esc(r.body)}</blockquote>
+        <figcaption>${esc(r.name)} on <a href="#/b/${esc(b.id)}">${esc(b.name)}</a></figcaption></figure>`; }).join('')}</div></section>` : ''}
+
+    <section class="sec band">
+      <div>
+        <h2>Cannot find it? Ask the whole community.</h2>
+        <p>Post what you need on the request board and let businesses come to you.</p>
+      </div>
+      <a class="btn btn-green" href="#/requests">Post a request</a>
+    </section>
+
+    <section class="sec band band-green">
+      <div>
+        <h2>Run a business in Mabvazuva?</h2>
+        <p>List it free in under two minutes. Your customers already live here.</p>
+        ${foundingNote()}
+      </div>
+      <a class="btn btn-brass" href="#/join">List your business</a>
+    </section>
+  </div>`;
+}
+
+const dealCard = b => `<a class="deal" href="#/b/${esc(b.id)}"><span class="deal-text">${esc(b.deal)}</span><span class="deal-by">${esc(b.name)}</span></a>`;
+
+function browse(parts, params) {
+  const q = (params.get('q') || '').trim(), cat = params.get('cat') || '';
+  let list = approved();
+  if (cat) list = list.filter(b => b.cat === cat);
+  if (q) {
+    const words = q.toLowerCase().split(/\s+/);
+    list = list.filter(b => {
+      const hay = [b.name, b.tagline, b.descr, catName(b.cat), (b.prices || []).map(p => p[0]).join(' ')].join(' ').toLowerCase();
+      return words.every(w => hay.includes(w) || hay.includes(w.replace(/s$/, '')));
+    });
+  }
+  const link = c => '#/browse?' + new URLSearchParams(Object.assign({}, q ? { q } : {}, c ? { cat: c } : {})).toString();
+  return `<div class="wrap page">
+    <h1>${cat ? esc(catName(cat)) : 'All businesses'}</h1>
+    <form class="search search-light" data-form="search" role="search">
+      <label class="sr" for="q">Search</label>
+      <input id="q" name="q" type="search" value="${esc(q)}" placeholder="Search businesses and services" autocomplete="off">
+      <input type="hidden" name="cat" value="${esc(cat)}">
+      <button class="btn btn-green" type="submit">Search</button>
+    </form>
+    <p class="chips"><a href="${link('')}" class="${cat ? '' : 'on'}">All</a>${CATS.map(c => `<a href="${link(c.id)}" class="${c.id === cat ? 'on' : ''}">${esc(c.name)}</a>`).join('')}</p>
+    ${list.length ? `<p class="result-count">${plural(list.length, 'business', 'businesses')}${q ? ` for “${esc(q)}”` : ''}</p><div class="rows">${list.map(row).join('')}</div>`
+      : `<div class="empty"><h2>Nobody is listed for ${q ? `“${esc(q)}”` : 'this'} yet.</h2>
+          <p>Post it on the request board and any business that can help will message you.</p>
+          <p><a class="btn btn-green" href="#/requests">Post a request</a> <a class="btn btn-line" href="#/join">I offer this</a></p></div>`}
+  </div>`;
+}
+
+const seen = new Set();
+function profile(parts) {
+  const b = byId(decodeURIComponent(parts[0] || ''));
+  if (!b) return notFound();
+  const own = ME.user && (b.owner === ME.user.id || ME.admin);
+  if (b.status === 'approved' && !own && !seen.has(b.id)) { seen.add(b.id); api.hit(b.id, 'view').catch(() => {}); }
+  const revs = reviewsOf(b), canReview = b.plan !== 'starter';
+  const hello = `Hi ${b.name}, I found you on ${C.siteName}.`;
+  const share = 'https://wa.me/?text=' + encodeURIComponent(`${b.name} on ${C.siteName}: ${b.tagline} ${siteUrl()}#/b/${b.id}`);
+  const waBtn = b.wa
+    ? `<a class="btn btn-wa" href="${waLink(b.wa, hello)}" target="_blank" rel="noopener" data-act="wa" data-id="${esc(b.id)}">Chat on WhatsApp</a>`
+    : `<button class="btn btn-wa" type="button" data-act="wa-preview" data-id="${esc(b.id)}">Chat on WhatsApp</button>`;
+  return `
+  <section class="pro-head">
+    <div class="wrap">
+      <p class="crumb"><a href="#/browse?cat=${b.cat}">${esc(catName(b.cat))}</a></p>
+      <div class="pro-id">${plaque(b, 'plaque-lg')}<div>
+        <h1>${esc(b.name)}</h1>
+        <p class="pro-tag">${esc(b.tagline)}</p>
+        <p class="pro-meta">${[tick(b), metaLine(b)].filter(Boolean).join('<span class="sep"></span>')}</p>
+      </div></div>
+    </div>
+  </section>
+  <div class="wrap page pro">
+    ${b.status !== 'approved' ? `<p class="notice">This listing is ${b.status === 'pending' ? 'waiting for approval' : 'not approved'}. Only you can see it.</p>` : ''}
+    ${b.photos && b.photos.length ? `<div class="gallery">${b.photos.map(p => `<img src="${esc(p)}" alt="Photo from ${esc(b.name)}" loading="lazy">`).join('')}</div>` : ''}
+    ${b.deal && b.plan !== 'starter' ? `<div class="deal deal-wide"><span class="deal-text">${esc(b.deal)}</span><span class="deal-by">Current deal</span></div>` : ''}
+    <div class="pro-grid">
+      <div>
+        ${b.descr ? `<section><h2>About</h2><p class="prose">${esc(b.descr)}</p>${b.owner_name ? `<p class="by">Run by ${esc(b.owner_name)}</p>` : ''}</section>` : ''}
+        ${canReview ? `<section><h2>Reviews</h2>
+          ${revs.length ? revs.map(r => `<div class="review"><p class="review-top"><span class="stars">${'★'.repeat(r.stars)}<span class="stars-off">${'★'.repeat(5 - r.stars)}</span></span> ${esc(r.name)}<span class="sep"></span>${ago(r.created_at)}</p><p>${esc(r.body)}</p></div>`).join('')
+            : '<p class="muted">No reviews yet. Used this business? Be the first to say how it went.</p>'}
+          <details class="add-review"><summary>Write a review</summary>
+            <form data-form="review" data-id="${esc(b.id)}">
+              ${field('Your name', '<input name="name" required maxlength="40" placeholder="e.g. Rumbi M.">')}
+              ${field('Rating', '<select name="stars"><option value="5">5, excellent</option><option value="4">4, good</option><option value="3">3, okay</option><option value="2">2, poor</option><option value="1">1, bad</option></select>')}
+              ${field('How did it go?', '<textarea name="body" required minlength="3" maxlength="600" rows="3"></textarea>')}
+              <button class="btn btn-green" type="submit">Post review</button>
+            </form></details></section>` : ''}
+      </div>
+      <aside>
+        ${(b.prices || []).length ? `<section><h2>Prices</h2><table class="prices">${b.prices.map(p => `<tr><td>${esc(p[0])}</td><td>${esc(p[1])}</td></tr>`).join('')}</table></section>` : ''}
+        ${b.hours ? `<section><h2>Hours</h2><p>${esc(b.hours)}</p></section>` : ''}
+        <p><a class="btn btn-line" href="${share}" target="_blank" rel="noopener">Share with a neighbour</a></p>
+      </aside>
+    </div>
+  </div>
+  <div class="sticky-wa"><div class="wrap">${waBtn}</div></div>`;
+}
+
+function requestsPage() {
+  return `<div class="wrap page">
+    <h1>Request board</h1>
+    <p class="lead">Say what you need. Any Mabvazuva business that can help will message you on WhatsApp.</p>
+    <form class="card-form" data-form="request">
+      ${field('What do you need?', '<input name="need" required minlength="5" maxlength="300" placeholder="e.g. A plumber for a leaking geyser">')}
+      <div class="two">
+        ${field('When?', '<input name="when_text" maxlength="60" placeholder="e.g. Saturday morning">')}
+        ${field('Category', `<select name="cat">${catOptions('other')}</select>`)}
+      </div>
+      <div class="two">
+        ${field('Your first name', '<input name="name" required maxlength="40">')}
+        ${field('Your WhatsApp number', '<input name="wa" required inputmode="tel" placeholder="e.g. 0771 234 567">', 'Never shown on the site. Only approved businesses that offer to help can message you.')}
+      </div>
+      <button class="btn btn-green" type="submit">Post request</button>
+    </form>
+    ${head('Open requests')}
+    ${DB.requests.length ? `<div class="reqs">${DB.requests.map(r => `
+      <div class="req">
+        <p class="req-need">${esc(r.need)}</p>
+        <p class="req-meta">${esc(r.name)}<span class="sep"></span>${esc(catName(r.cat))}${r.when_text ? `<span class="sep"></span>${esc(r.when_text)}` : ''}<span class="sep"></span>${ago(r.created_at)}</p>
+        <p class="req-foot"><span class="muted">${r.replies ? plural(r.replies, 'business has', 'businesses have') + ' offered to help' : 'No offers yet. Be the first.'}</span>
+        <span data-slot="${esc(r.id)}"><button class="btn btn-line btn-small" type="button" data-act="respond" data-id="${esc(r.id)}">I can help</button></span></p>
+      </div>`).join('')}</div>` : '<p class="muted">No open requests right now. Yours could be the first.</p>'}
+  </div>`;
+}
+
+function dealsPage() {
+  const list = approved(), deals = list.filter(b => b.deal && b.plan !== 'starter'), fresh = list.filter(isNew);
+  let digest = `What's new in Mabvazuva this week\n`;
+  if (fresh.length) digest += `\nNew businesses:\n` + fresh.map(b => `- ${b.name}: ${b.tagline}`).join('\n') + '\n';
+  if (deals.length) digest += `\nDeals:\n` + deals.map(b => `- ${b.name}: ${b.deal}`).join('\n') + '\n';
+  if (DB.events.length) digest += `\nComing up:\n` + DB.events.map(e => `- ${e.date_text}: ${e.title}`).join('\n') + '\n';
+  digest += `\nSee it all: ${siteUrl()}`;
+  return `<div class="wrap page">
+    <h1>Deals and events</h1>
+    <p class="lead">Offers from businesses inside the gate, and what is happening in the community.</p>
+    ${fresh.length || deals.length || DB.events.length ? `<p><a class="btn btn-wa" href="https://wa.me/?text=${encodeURIComponent(digest)}" target="_blank" rel="noopener">Share this week's digest on WhatsApp</a></p>` : ''}
+    ${head('Deals')}
+    ${deals.length ? `<div class="deals">${deals.map(dealCard).join('')}</div>` : '<p class="muted">No deals running right now. Business owners can post one from their dashboard.</p>'}
+    ${head('Community events')}
+    ${DB.events.length ? `<ul class="events">${DB.events.map(e => `<li><span class="ev-date">${esc(e.date_text)}</span><span><strong>${esc(e.title)}</strong><br>${esc(e.detail)}</span></li>`).join('')}</ul>` : '<p class="muted">Nothing on the calendar yet.</p>'}
+  </div>`;
+}
+
+function planCards(mode, selected) {
+  const fl = foundingLeft() > 0;
+  return ['premium', 'growth', 'starter'].map(id => {
+    const p = C.plans[id], price = priceNow(id);
+    const priceHtml = p.price === 0 ? '<span class="price-n">Free</span>'
+      : `<span class="price-n">$${price}</span><span class="price-per">a month</span>${fl ? `<span class="price-was">$${p.price} after founding places fill</span>` : ''}`;
+    const body = `
+      ${id === 'growth' ? '<span class="pop">Most popular</span>' : ''}
+      <span class="plan-name">${p.name}</span>
+      <span class="plan-line">${esc(p.line)}</span>
+      <span class="price">${priceHtml}</span>
+      <ul>${p.features.map(f => `<li>${esc(f)}</li>`).join('')}</ul>`;
+    return mode === 'pick'
+      ? `<label class="plan plan-${id}"><input type="radio" name="plan" value="${id}"${id === selected ? ' checked' : ''}>${body}<span class="plan-pick">Choose ${p.name}</span></label>`
+      : `<div class="plan plan-${id}">${body}<a class="btn ${id === 'growth' ? 'btn-brass' : 'btn-line'}" href="#/join?plan=${id}">${p.price ? 'Start with ' + p.name : 'List free'}</a></div>`;
+  }).join('');
+}
+
+function pricing() {
+  const taken = featuredList().length;
+  return `<div class="wrap page">
+    <h1>Put your business in front of every household in Mabvazuva.</h1>
+    <p class="lead">Start free. Move up when the enquiries come in. No contracts, cancel any month.</p>
+    ${foundingNote()}
+    <div class="plans">${planCards('show')}</div>
+    <p class="muted">${C.featuredSlots - taken} of ${C.featuredSlots} homepage feature slots are open. Pay monthly by EcoCash, bank transfer or cash. Every listing is checked by the admin before it goes live.</p>
+    <div class="faq">
+      <details><summary>Do I need a registered company?</summary><p>No. If you offer a service in or for Mabvazuva, you can list it: lessons, baking, repairs, anything.</p></details>
+      <details><summary>How do customers reach me?</summary><p>Every listing has one WhatsApp button that opens a chat with you. No middleman and no commission.</p></details>
+      <details><summary>What does the Verified resident badge mean?</summary><p>The admin has confirmed that the owner lives in Mabvazuva.</p></details>
+    </div>
+  </div>`;
+}
+
+/* ---- list your business: 3 steps ---- */
+let J = { step: 1, d: {}, plan: 'growth' };
+function join(parts, params) {
+  if (params.get('plan') && C.plans[params.get('plan')]) J.plan = params.get('plan');
+  const d = J.d;
+  const steps = `<ol class="steps">${['Your business', 'How to reach you', 'Choose a plan'].map((s, i) => `<li class="${J.step === i + 1 ? 'on' : J.step > i + 1 ? 'done' : ''}">${s}</li>`).join('')}</ol>`;
+  if (J.step === 4) {
+    const msg = `Hi, I have just listed "${J.d.name}" on ${C.siteName}${J.plan !== 'starter' ? ` and would like the ${C.plans[J.plan].name} plan` : ''}.`;
+    const paid = J.plan !== 'starter';
+    const html = `<div class="wrap page narrow"><div class="done-box">
+      <h1>Sent for approval.</h1>
+      <p>${esc(J.d.name)} will appear in the directory as soon as the admin has checked it, usually within a day.</p>
+      ${paid ? `<p>You chose ${C.plans[J.plan].name} at $${priceNow(J.plan)} a month. ${C.paymentNote ? esc(C.paymentNote) : 'The admin will WhatsApp you the payment details.'} Your listing starts on Starter and moves up once payment is in.</p>` : ''}
+      <p>${C.adminWhatsApp ? `<a class="btn btn-wa" href="${waLink(C.adminWhatsApp, msg)}" target="_blank" rel="noopener">Tell the admin on WhatsApp</a> ` : ''}<a class="btn btn-green" href="#/dashboard">Add photos and prices</a></p>
+    </div></div>`;
+    J = { step: 1, d: {}, plan: 'growth' };
+    return html;
+  }
+  if (J.step === 5) {
+    return `<div class="wrap page narrow"><div class="done-box"><h1>Check your email.</h1>
+      <p>We sent a confirmation link to your address. Open it, then sign in here and your listing will be sent for approval automatically.</p>
+      <p><a class="btn btn-green" href="#/account">Sign in</a></p></div></div>`;
+  }
+  let body;
+  if (J.step === 1) body = `<form data-form="join1">
+      ${field('Business name', `<input name="name" required minlength="2" maxlength="80" value="${esc(d.name)}" placeholder="e.g. Mai Tino's Bakes">`)}
+      ${field('Category', `<select name="cat">${catOptions(d.cat || 'other')}</select>`)}
+      ${field('What do you offer, in one line?', `<input name="tagline" required maxlength="140" value="${esc(d.tagline)}" placeholder="e.g. Celebration cakes and weekend bakes">`)}
+      ${field('Tell neighbours more', `<textarea name="descr" rows="4" maxlength="2000" placeholder="What you do, who it is for, how to order">${esc(d.descr)}</textarea>`, 'Optional. You can add this later.')}
+      <button class="btn btn-green" type="submit">Next</button></form>`;
+  else if (J.step === 2) body = `<form data-form="join2">
+      ${field('Your name', `<input name="owner_name" required maxlength="60" value="${esc(d.owner_name)}">`)}
+      ${field('WhatsApp number for customers', `<input name="wa" required inputmode="tel" value="${esc(d.wa)}" placeholder="e.g. 0771 234 567">`, 'This is the number the Chat on WhatsApp button opens.')}
+      ${field('Opening hours', `<input name="hours" maxlength="120" value="${esc(d.hours)}" placeholder="e.g. Mon to Sat, 8am to 5pm">`, 'Optional.')}
+      <p class="form-nav"><button class="btn btn-line" type="button" data-act="join-back">Back</button> <button class="btn btn-green" type="submit">Next</button></p></form>`;
+  else body = `<form data-form="join3">
+      ${foundingNote()}
+      <div class="plans plans-pick">${planCards('pick', J.plan)}</div>
+      <p class="muted">Nothing is charged now. Paid plans start once you pay the admin by EcoCash, bank transfer or cash.</p>
+      ${ME.user ? `<p class="muted">Listing as ${esc(ME.user.email)}.</p>` : `
+        <h2>Create your login</h2>
+        <p class="muted">So you can edit your listing later. Already have one? <a href="#/account">Sign in first</a>.</p>
+        <div class="two">${field('Email', '<input name="email" type="email" required autocomplete="email">')}${field('Password', '<input name="password" type="password" required minlength="6" autocomplete="new-password">', 'At least 6 characters.')}</div>`}
+      <p class="form-nav"><button class="btn btn-line" type="button" data-act="join-back">Back</button> <button class="btn btn-brass" type="submit">Send my listing for approval</button></p></form>`;
+  return `<div class="wrap page ${J.step === 3 ? '' : 'narrow'}">
+    <h1>List your business</h1>
+    <p class="lead">Three short steps. Under two minutes.</p>
+    ${steps}${body}</div>`;
+}
+
+function account(parts, params) {
+  if (ME.user) {
+    const m = mine();
+    return `<div class="wrap page narrow"><h1>Your account</h1>
+      <p class="lead">Signed in as ${esc(ME.user.email)}.</p>
+      ${m.length ? `<div class="rows">${m.map(b => `<a class="row" href="#/dashboard?id=${esc(b.id)}">${plaque(b)}<span class="row-main"><span class="row-name">${esc(b.name)}</span><span class="row-meta">${statusText(b)}</span></span></a>`).join('')}</div>`
+        : '<p>You have no listing yet. <a href="#/join">List your business</a>.</p>'}
+      <p>${ME.admin ? '<a class="btn btn-green" href="#/admin">Open admin</a> ' : ''}<button class="btn btn-line" type="button" data-act="signout">Sign out</button></p></div>`;
+  }
+  const isNewAcc = params.get('mode') === 'new';
+  return `<div class="wrap page narrow"><h1>${isNewAcc ? 'Create an account' : 'Sign in'}</h1>
+    <p class="lead">For business owners. You do not need an account to browse or contact a business.</p>
+    <form data-form="${isNewAcc ? 'signup' : 'signin'}">
+      ${field('Email', '<input name="email" type="email" required autocomplete="email">')}
+      ${field('Password', `<input name="password" type="password" required minlength="6" autocomplete="${isNewAcc ? 'new-password' : 'current-password'}">`)}
+      <button class="btn btn-green" type="submit">${isNewAcc ? 'Create account' : 'Sign in'}</button>
+    </form>
+    <p class="muted">${isNewAcc ? 'Already registered? <a href="#/account">Sign in</a>.' : 'New here? <a href="#/join">List your business</a> and your login is created on the way, or <a href="#/account?mode=new">create an account</a>.'}</p></div>`;
+}
+
+const statusText = b => (b.status === 'approved' ? 'Live' : b.status === 'pending' ? 'Waiting for approval' : 'Not approved') + ', ' + C.plans[b.plan].name + ' plan';
+
+async function dashboard(parts, params) {
+  if (!ME.user) return `<div class="wrap page narrow"><h1>Business dashboard</h1><p class="lead">Sign in to manage your listing.</p><p><a class="btn btn-green" href="#/account">Sign in</a> <a class="btn btn-line" href="#/join">List your business</a></p></div>`;
+  const id = params.get('id'), m = mine();
+  const b = id ? DB.all.find(x => x.id === id && (x.owner === ME.user.id || ME.admin)) : m[0];
+  if (!b) return `<div class="wrap page narrow"><h1>Business dashboard</h1><p class="lead">You have no listing yet.</p><p><a class="btn btn-green" href="#/join">List your business</a></p></div>`;
+  const st = await api.stats(b.id);
+  const paid = b.plan !== 'starter', p = C.plans[b.plan];
+  const inCat = approved().filter(x => x.cat === b.cat), pos = inCat.findIndex(x => x.id === b.id) + 1;
+  const max = Math.max(1, ...st.wa), labels = ['3 weeks ago', '2 weeks ago', 'Last week', 'This week'];
+  const share = 'https://wa.me/?text=' + encodeURIComponent(`Find ${b.name} on ${C.siteName}: ${siteUrl()}#/b/${b.id}`);
+  const wants = b.requested_plan !== b.plan && RANK[b.requested_plan] < RANK[b.plan];
+  const photos = b.photos || [];
+
+  return `<div class="wrap page">
+    ${m.length > 1 ? `<p class="chips">${m.map(x => `<a href="#/dashboard?id=${esc(x.id)}" class="${x.id === b.id ? 'on' : ''}">${esc(x.name)}</a>`).join('')}</p>` : ''}
+    <h1>${esc(b.name)}</h1>
+    <p class="lead">${statusText(b)}. ${b.status === 'approved' ? `<a href="#/b/${esc(b.id)}">View listing</a>` : ''}</p>
+    ${b.status === 'pending' ? '<p class="notice">Your listing is with the admin for approval. You can add photos and prices while you wait.</p>' : ''}
+    ${b.status === 'rejected' ? `<p class="notice">This listing was not approved. ${C.adminWhatsApp ? `<a href="${waLink(C.adminWhatsApp, 'Hi, about my listing ' + b.name)}" target="_blank" rel="noopener">Message the admin</a> to find out why.` : ''}</p>` : ''}
+    ${wants ? `<p class="notice">You asked for ${C.plans[b.requested_plan].name} at $${priceNow(b.requested_plan)} a month. ${C.paymentNote ? esc(C.paymentNote) : 'The admin will WhatsApp you the payment details.'} It switches on once payment is in.</p>` : ''}
+
+    <section class="dash-stats">
+      <div class="stat"><span class="stat-n">${st.view[3]}</span><span class="stat-l">profile views this week</span></div>
+      ${paid ? `<div class="stat"><span class="stat-n">${st.wa[3]}</span><span class="stat-l">WhatsApp clicks this week</span></div>` : ''}
+      ${pos ? `<div class="stat"><span class="stat-n">${pos}<small> of ${inCat.length}</small></span><span class="stat-l">your position in ${esc(catName(b.cat))}</span></div>` : ''}
+    </section>
+    ${paid ? `<section><h2>WhatsApp clicks, last 4 weeks</h2>
+      <div class="bars">${st.wa.map((n, i) => `<div class="bar"><span class="bar-n">${n}</span><span class="bar-fill" style="height:${Math.round(n / max * 100)}%"></span><span class="bar-l">${labels[i]}</span></div>`).join('')}</div></section>`
+      : `<section class="upsell"><h2>${st.view[3]} ${st.view[3] === 1 ? 'neighbour' : 'neighbours'} looked at your listing this week.</h2>
+          <p>How many tapped WhatsApp? On Starter you cannot see that, and paid listings sit above yours in every search. Growth shows you clicks week by week, lets you post deals and collect reviews.</p>
+          <form data-form="plan" data-id="${esc(b.id)}"><input type="hidden" name="plan" value="growth"><button class="btn btn-brass" type="submit">Ask for Growth, $${priceNow('growth')} a month</button></form></section>`}
+    ${b.plan === 'growth' && pos > 1 ? `<section class="upsell"><h2>You are number ${pos} in ${esc(catName(b.cat))}.</h2><p>Premium listings always show first, and get a homepage feature slot and the Verified resident badge.</p>
+      <form data-form="plan" data-id="${esc(b.id)}"><input type="hidden" name="plan" value="premium"><button class="btn btn-brass" type="submit">Ask for Premium, $${priceNow('premium')} a month</button></form></section>` : ''}
+
+    <section><h2>Bring your own customers</h2>
+      <p>Listings that are shared in the estate WhatsApp groups get seen first.</p>
+      <p><a class="btn btn-wa" href="${share}" target="_blank" rel="noopener">Share my listing on WhatsApp</a></p></section>
+
+    <section><h2>Photos</h2>
+      <p class="muted">${photos.length} of ${p.photos} used on ${p.name}.</p>
+      <div class="thumbs">${photos.map((u, i) => `<span class="thumb"><img src="${esc(u)}" alt=""><button type="button" data-act="photo-del" data-id="${esc(b.id)}" data-i="${i}" aria-label="Remove photo">Remove</button></span>`).join('')}</div>
+      ${photos.length < p.photos ? `<label class="btn btn-line file">Add a photo<input type="file" accept="image/*" data-change="photo" data-id="${esc(b.id)}"></label>` : (b.plan === 'starter' ? '<p class="muted">Growth and Premium listings can show up to 8 photos.</p>' : '')}
+    </section>
+
+    <section><h2>Your listing</h2>
+      <form data-form="edit" data-id="${esc(b.id)}">
+        ${field('Business name', `<input name="name" required minlength="2" maxlength="80" value="${esc(b.name)}">`)}
+        ${field('Category', `<select name="cat">${catOptions(b.cat)}</select>`)}
+        ${field('One-line summary', `<input name="tagline" required maxlength="140" value="${esc(b.tagline)}">`)}
+        ${field('About', `<textarea name="descr" rows="5" maxlength="2000">${esc(b.descr)}</textarea>`)}
+        ${field('Prices', `<textarea name="prices" rows="4" placeholder="Exterior wash - $5">${esc((b.prices || []).map(x => x[0] + ' - ' + x[1]).join('\n'))}</textarea>`, 'One per line, as: item - price')}
+        <div class="two">${field('Opening hours', `<input name="hours" maxlength="120" value="${esc(b.hours)}">`)}${field('WhatsApp number', `<input name="wa" required inputmode="tel" value="${esc(b.wa)}">`)}</div>
+        ${field('Your name', `<input name="owner_name" maxlength="60" value="${esc(b.owner_name)}">`)}
+        ${paid ? field('Current deal', `<input name="deal" maxlength="200" value="${esc(b.deal)}" placeholder="e.g. First wash free on a monthly plan">`, 'Shown on the homepage and the deals page. Leave empty for no deal.') : ''}
+        <button class="btn btn-green" type="submit">Save changes</button>
+      </form></section>
+  </div>`;
+}
+
+function admin() {
+  if (!ME.user) return `<div class="wrap page narrow"><h1>Admin</h1><p><a class="btn btn-green" href="#/account">Sign in</a></p></div>`;
+  if (!ME.admin) return `<div class="wrap page narrow"><h1>Admin</h1><p class="lead">This account is not an admin.</p></div>`;
+  const pending = DB.all.filter(b => b.status === 'pending');
+  const rest = DB.all.filter(b => b.status !== 'pending').sort((a, b) => RANK[a.plan] - RANK[b.plan] || a.name.localeCompare(b.name));
+  const payers = rest.filter(b => b.status === 'approved' && b.plan !== 'starter' && b.paid);
+  const revenue = payers.reduce((a, b) => a + C.plans[b.plan].price, 0);
+  const featN = DB.all.filter(b => b.featured).length;
+  const tog = (b, f, on, off) => `<button type="button" class="tog ${b[f] ? 'on' : ''}" data-act="adm-toggle" data-id="${esc(b.id)}" data-f="${f}">${b[f] ? on : off}</button>`;
+  return `<div class="wrap page">
+    <h1>Admin</h1>
+    <section class="dash-stats">
+      <div class="stat"><span class="stat-n">${DB.all.filter(b => b.status === 'approved').length}</span><span class="stat-l">live listings</span></div>
+      <div class="stat"><span class="stat-n">${payers.length}</span><span class="stat-l">paying businesses</span></div>
+      <div class="stat"><span class="stat-n">$${revenue}</span><span class="stat-l">a month at full list prices</span></div>
+      <div class="stat"><span class="stat-n">${featN}<small> of ${C.featuredSlots}</small></span><span class="stat-l">feature slots used</span></div>
+    </section>
+
+    <section><h2>Waiting for approval</h2>
+      ${pending.length ? pending.map(b => `<div class="adm-pending">
+        <p><strong>${esc(b.name)}</strong><span class="sep"></span>${esc(catName(b.cat))}<span class="sep"></span>asked for ${C.plans[b.requested_plan || 'starter'].name}</p>
+        <p>${esc(b.tagline)}</p><p class="muted">${esc(b.owner_name)}${b.wa ? `<span class="sep"></span><a href="${waLink(b.wa)}" target="_blank" rel="noopener">WhatsApp ${esc(b.wa)}</a>` : ''}<span class="sep"></span><a href="#/b/${esc(b.id)}">Preview</a></p>
+        <p><button class="btn btn-green btn-small" type="button" data-act="adm-status" data-id="${esc(b.id)}" data-v="approved">Approve</button>
+        <button class="btn btn-line btn-small" type="button" data-act="adm-status" data-id="${esc(b.id)}" data-v="rejected">Reject</button></p></div>`).join('')
+        : '<p class="muted">Nothing waiting.</p>'}</section>
+
+    <section><h2>All businesses</h2>
+      <div class="table-scroll"><table class="adm">
+        <thead><tr><th>Business</th><th>Plan</th><th>Paid</th><th>Verified</th><th>Featured</th><th></th></tr></thead>
+        <tbody>${rest.map(b => `<tr>
+          <td><a href="#/b/${esc(b.id)}">${esc(b.name)}</a>${b.status === 'rejected' ? ' <span class="muted">(rejected)</span>' : ''}${b.requested_plan && b.requested_plan !== b.plan ? `<br><span class="muted">asked for ${C.plans[b.requested_plan].name}</span>` : ''}</td>
+          <td><select data-change="adm-plan" data-id="${esc(b.id)}" aria-label="Plan for ${esc(b.name)}">${['starter', 'growth', 'premium'].map(x => `<option value="${x}"${x === b.plan ? ' selected' : ''}>${C.plans[x].name}</option>`).join('')}</select></td>
+          <td>${b.plan === 'starter' ? '<span class="muted">Free</span>' : tog(b, 'paid', 'Paid', 'Not paid')}</td>
+          <td>${tog(b, 'verified', 'Verified', 'No')}</td>
+          <td>${b.plan === 'premium' ? tog(b, 'featured', 'Featured', 'No') : '<span class="muted">Premium only</span>'}</td>
+          <td class="adm-acts"><a href="#/dashboard?id=${esc(b.id)}">Edit</a> ${b.status === 'rejected' ? `<button type="button" class="link" data-act="adm-status" data-id="${esc(b.id)}" data-v="approved">Approve</button>` : ''} <button type="button" class="link danger" data-act="adm-delete" data-id="${esc(b.id)}">Delete</button></td>
+        </tr>`).join('')}</tbody></table></div>
+      ${rest.length ? '' : '<p class="muted">No businesses yet.</p>'}</section>
+
+    <section><h2>Community events</h2>
+      <form class="card-form" data-form="event"><div class="two">${field('When', '<input name="date_text" required maxlength="40" placeholder="e.g. Sat 21 Nov">')}${field('Title', '<input name="title" required maxlength="80">')}</div>
+        ${field('Details', '<input name="detail" maxlength="200">')}<button class="btn btn-green" type="submit">Add event</button></form>
+      <ul class="adm-list">${DB.events.map(e => `<li>${esc(e.date_text)}: ${esc(e.title)} <button type="button" class="link danger" data-act="adm-del" data-kind="Event" data-id="${esc(e.id)}">Remove</button></li>`).join('')}</ul></section>
+
+    <section><h2>Requests</h2><ul class="adm-list">${DB.requests.map(r => `<li>${esc(r.name)}: ${esc(r.need)} <button type="button" class="link danger" data-act="adm-del" data-kind="Request" data-id="${esc(r.id)}">Remove</button></li>`).join('') || '<li class="muted">None.</li>'}</ul></section>
+
+    <section><h2>Reviews</h2><ul class="adm-list">${DB.reviews.map(r => `<li>${'★'.repeat(r.stars)} ${esc(r.name)} on ${esc((byId(r.business_id) || {}).name || 'deleted business')}: ${esc(r.body)} <button type="button" class="link danger" data-act="adm-del" data-kind="Review" data-id="${esc(r.id)}">Remove</button></li>`).join('') || '<li class="muted">None.</li>'}</ul></section>
+  </div>`;
+}
+
+const notFound = () => `<div class="wrap page narrow"><h1>That page is not here.</h1><p><a class="btn btn-green" href="#/">Back to the directory</a></p></div>`;
+
+/* ---------------- router ---------------- */
+const routes = { '': home, browse, b: profile, requests: requestsPage, deals: dealsPage, pricing, join, account, dashboard, admin };
+async function render(keepScroll) {
+  const h = location.hash.replace(/^#\/?/, ''), cut = h.indexOf('?');
+  const path = cut < 0 ? h : h.slice(0, cut), params = new URLSearchParams(cut < 0 ? '' : h.slice(cut + 1));
+  const parts = path.split('/'), fn = routes[parts[0]] || notFound;
+  try { app.innerHTML = await fn(parts.slice(1), params); }
+  catch (e) { app.innerHTML = `<div class="wrap page narrow"><h1>Something went wrong.</h1><p>${esc(e.message)}</p><p><a class="btn btn-green" href="#/">Back to the directory</a></p></div>`; }
+  const key = parts[0] || 'home';
+  document.querySelectorAll('[data-nav]').forEach(a => a.classList.toggle('on', a.dataset.nav === key));
+  $('#nav-account').textContent = ME.user ? 'Account' : 'Sign in';
+  $('#foot-admin').hidden = !ME.admin;
+  document.body.classList.toggle('has-sticky', !!$('.sticky-wa'));
+  document.title = ($('#app h1') ? $('#app h1').textContent + ' | ' : '') + C.siteName;
+  if (!keepScroll) window.scrollTo(0, 0);
+}
+const refresh = async () => { await api.load(); await render(true); };
+const go = hash => { if (location.hash === hash) render(); else location.hash = hash; };
+
+/* ---------------- forms ---------------- */
+const forms = {
+  async search(fd) { const q = val(fd, 'q'), cat = val(fd, 'cat'); go('#/browse?' + new URLSearchParams(Object.assign({}, q ? { q } : {}, cat ? { cat } : {})).toString()); },
+  async join1(fd) { Object.assign(J.d, { name: val(fd, 'name'), cat: val(fd, 'cat'), tagline: val(fd, 'tagline'), descr: val(fd, 'descr') }); J.step = 2; render(); },
+  async join2(fd) {
+    const wa = digits(val(fd, 'wa'));
+    if (wa.length < 9) return toast('Enter a full WhatsApp number, for example 0771 234 567.');
+    Object.assign(J.d, { owner_name: val(fd, 'owner_name'), wa, hours: val(fd, 'hours') }); J.step = 3; render();
+  },
+  async join3(fd) {
+    J.plan = val(fd, 'plan') || 'starter';
+    const d = Object.assign({}, J.d, { requested_plan: J.plan });
+    if (!ME.user) {
+      const hasSession = await api.signUp(val(fd, 'email'), val(fd, 'password'));
+      if (!hasSession) { ls.set('mm_draft', d); J.step = 5; return render(); }
+    }
+    await api.createBiz(d);
+    J.step = 4; await api.load(); go('#/join');
+  },
+  async signin(fd) { await api.signIn(val(fd, 'email'), val(fd, 'password')); await afterSignIn(); },
+  async signup(fd) {
+    const has = await api.signUp(val(fd, 'email'), val(fd, 'password'));
+    if (!has) return toast('Check your email for a confirmation link, then sign in.');
+    await afterSignIn();
+  },
+  async review(fd, f) {
+    await api.addReview({ business_id: f.dataset.id, name: val(fd, 'name'), stars: Number(val(fd, 'stars')), body: val(fd, 'body') });
+    toast('Review posted. Thank you.'); await refresh();
+  },
+  async request(fd) {
+    const wa = digits(val(fd, 'wa'));
+    if (wa.length < 9) return toast('Enter a full WhatsApp number so businesses can reach you.');
+    await api.addRequest({ need: val(fd, 'need'), when_text: val(fd, 'when_text'), name: val(fd, 'name'), cat: val(fd, 'cat'), wa });
+    toast('Request posted. Businesses that can help will message you.'); await refresh();
+  },
+  async edit(fd, f) {
+    const prices = val(fd, 'prices').split('\n').map(l => l.trim()).filter(Boolean).map(l => { const i = l.lastIndexOf(' - '); return i < 0 ? [l, ''] : [l.slice(0, i).trim(), l.slice(i + 3).trim()]; }).slice(0, 20);
+    const p = { name: val(fd, 'name'), cat: val(fd, 'cat'), tagline: val(fd, 'tagline'), descr: val(fd, 'descr'), prices, hours: val(fd, 'hours'), wa: digits(val(fd, 'wa')), owner_name: val(fd, 'owner_name') };
+    if (fd.has('deal')) p.deal = val(fd, 'deal');
+    await api.updateBiz(f.dataset.id, p); toast('Changes saved.'); await refresh();
+  },
+  async plan(fd, f) {
+    const plan = val(fd, 'plan');
+    await api.updateBiz(f.dataset.id, { requested_plan: plan });
+    toast(`${C.plans[plan].name} requested. It switches on once payment is in.`); await refresh();
+  },
+  async event(fd) { await api.addEvent({ date_text: val(fd, 'date_text'), title: val(fd, 'title'), detail: val(fd, 'detail') }); toast('Event added.'); await refresh(); }
+};
+async function afterSignIn() {
+  const draft = ls.get('mm_draft');
+  if (draft && ME.user) { await api.createBiz(draft); ls.del('mm_draft'); toast('Your listing was sent for approval.'); }
+  await api.load(); go(mine().length ? '#/dashboard' : '#/account');
+}
+
+/* ---------------- buttons ---------------- */
+const acts = {
+  wa(t) { api.hit(t.dataset.id, 'wa').catch(() => {}); },
+  'wa-preview'(t) { api.hit(t.dataset.id, 'wa'); toast('Sample listing. On a real listing this opens a WhatsApp chat with the owner.'); },
+  'join-back'() { J.step = Math.max(1, J.step - 1); render(); },
+  async signout() { await api.signOut(); await api.load(); go('#/'); },
+  async respond(t) {
+    if (!ME.user) return toast('Only listed businesses can reply. Sign in, or list your business free.');
+    const r = await api.requestContact(t.dataset.id);
+    if (r.denied) return toast('Only approved businesses can reply. List your business free to answer requests.');
+    const slot = document.querySelector(`[data-slot="${t.dataset.id}"]`), req = DB.requests.find(x => x.id === t.dataset.id);
+    if (!r.wa) { slot.innerHTML = '<span class="muted">No number was left for this request.</span>'; return; }
+    slot.innerHTML = `<a class="btn btn-wa btn-small" href="${waLink(r.wa, `Hi ${req ? req.name : ''}, I saw your request on ${C.siteName} and I can help.`)}" target="_blank" rel="noopener">Open WhatsApp chat</a>`;
+  },
+  async 'photo-del'(t) {
+    const b = byId(t.dataset.id), photos = (b.photos || []).slice(); photos.splice(Number(t.dataset.i), 1);
+    await api.updateBiz(b.id, { photos }); await refresh();
+  },
+  async 'adm-status'(t) { await api.updateBiz(t.dataset.id, { status: t.dataset.v }); toast(t.dataset.v === 'approved' ? 'Approved. The listing is live.' : 'Rejected.'); await refresh(); },
+  async 'adm-toggle'(t) {
+    const b = byId(t.dataset.id), f = t.dataset.f;
+    if (f === 'featured' && !b.featured && DB.all.filter(x => x.featured).length >= C.featuredSlots) return toast(`All ${C.featuredSlots} feature slots are taken. Free one up first.`);
+    await api.updateBiz(b.id, { [f]: !b[f] }); await refresh();
+  },
+  async 'adm-delete'(t) {
+    if (t.dataset.sure !== '1') { t.dataset.sure = '1'; t.textContent = 'Tap again to delete'; return; }
+    await api.deleteBiz(t.dataset.id); toast('Listing deleted.'); await refresh();
+  },
+  async 'adm-del'(t) { await api['delete' + t.dataset.kind](t.dataset.id); toast(t.dataset.kind + ' removed.'); await refresh(); },
+  'preview-reset'() { ls.del(PKEY); S = seed(); persist(); api.session().then(refresh); toast('Preview reset to the sample data.'); }
+};
+const changes = {
+  async 'adm-plan'(t) {
+    const p = { plan: t.value }; if (t.value !== 'premium') p.featured = false; if (t.value === 'starter') p.paid = false;
+    await api.updateBiz(t.dataset.id, p); toast('Plan changed.'); await refresh();
+  },
+  async photo(t) {
+    const file = t.files && t.files[0]; if (!file) return;
+    toast('Uploading photo…');
+    const blob = await shrink(file, LIVE ? 1280 : 560);
+    const url = await api.upload(t.dataset.id, blob), b = byId(t.dataset.id);
+    await api.updateBiz(b.id, { photos: (b.photos || []).concat(url) }); toast('Photo added.'); await refresh();
+  }
+};
+function shrink(file, max) {
+  return new Promise((res, rej) => {
+    const img = new Image(), url = URL.createObjectURL(file);
+    img.onload = () => {
+      const k = Math.min(1, max / Math.max(img.width, img.height)), c = document.createElement('canvas');
+      c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height); URL.revokeObjectURL(url);
+      c.toBlob(b => b ? res(b) : rej(new Error('Could not read that image.')), 'image/jpeg', 0.8);
+    };
+    img.onerror = () => rej(new Error('Could not read that image.'));
+    img.src = url;
+  });
+}
+const nice = e => {
+  const m = (e && e.message) || 'Something went wrong.';
+  if (/already registered/i.test(m)) return 'That email already has an account. Sign in instead.';
+  if (/invalid login/i.test(m)) return 'Wrong email or password.';
+  if (/not confirmed/i.test(m)) return 'Confirm your email first. Check your inbox for the link.';
+  return m;
+};
+document.addEventListener('submit', async e => {
+  const f = e.target.closest('form[data-form]'); if (!f) return;
+  e.preventDefault();
+  const btn = f.querySelector('[type=submit]'); if (btn) btn.disabled = true;
+  try { await forms[f.dataset.form](new FormData(f), f); } catch (err) { toast(nice(err)); }
+  if (btn) btn.disabled = false;
+});
+document.addEventListener('click', async e => {
+  const t = e.target.closest('[data-act]'); if (!t) return;
+  try { await acts[t.dataset.act](t); } catch (err) { toast(nice(err)); }
+});
+document.addEventListener('change', async e => {
+  const t = e.target.closest('[data-change]'); if (!t) return;
+  try { await changes[t.dataset.change](t); } catch (err) { toast(nice(err)); }
+});
+window.addEventListener('hashchange', () => render());
+
+/* ---------------- start ---------------- */
+(async function start() {
+  try {
+    if (LIVE && !sb) throw new Error('Could not load the database library. Check your connection and reload.');
+    if (!LIVE) {
+      S = ls.get(PKEY) || seed(); persist();
+      $('#ribbon').innerHTML = `<div class="ribbon"><span>Preview mode: sample businesses, saved on this device only. Connect the database to go live.</span> <button type="button" data-act="preview-reset">Reset preview</button></div>`;
+    }
+    await api.session(); await api.load();
+  } catch (e) { toast(nice(e)); }
+  render();
+})();
+
+})();
