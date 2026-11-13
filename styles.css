@@ -1,10 +1,10 @@
-/* Mabvazuva Market. Mabvazuva means "where the sun rises": deep estate green, brass, morning light. */
+/* Mabvazuva Market. Plain, muted colours. */
 :root {
-  --green: #123A2E;
-  --green-deep: #0B2A21;
+  --green: #2B4A40;
+  --green-deep: #223B33;
   --green-soft: #E3ECE5;
-  --brass: #C8973E;
-  --sun: #EDBE62;
+  --brass: #B59A63;
+  --sun: #CDB887;
   --paper: #FBF8F1;
   --card: #FFFFFF;
   --ink: #1A211D;
@@ -77,13 +77,10 @@ p { margin: 0 0 1em; }
 
 /* hero: the sun coming up behind the estate */
 .hero { position: relative; overflow: hidden; background: var(--green); color: #fff; }
-.hero-in { position: relative; padding-top: 44px; padding-bottom: 52px; }
-.hero h1 { font-size: clamp(2.25rem, 9vw, 4.25rem); max-width: 14ch; margin-bottom: .35em; }
+.hero-in { position: relative; padding-top: 32px; padding-bottom: 36px; }
+.hero h1 { font-size: clamp(1.75rem, 5vw, 2.5rem); max-width: 22ch; margin-bottom: .35em; }
 .hero-sub { font-size: 1.125rem; color: #d5e0d8; max-width: 44ch; }
-.sun { position: absolute; right: -90px; bottom: -210px; width: 420px; height: 420px; border-radius: 50%;
-  background: radial-gradient(circle, var(--sun) 0 34%, rgba(237,190,98,.34) 34% 35%, transparent 35% 47%, rgba(237,190,98,.2) 47% 48%, transparent 48% 61%, rgba(237,190,98,.11) 61% 62%, transparent 62%);
-  animation: rise 1.4s cubic-bezier(.2,.7,.2,1) both; }
-@keyframes rise { from { transform: translateY(150px); opacity: .2; } }
+.sun { display: none; }
 .search { display: flex; gap: 8px; margin-top: 26px; max-width: 560px; }
 .search input[type=search] { flex: 1; min-width: 0; min-height: 52px; padding: 0 16px; border-radius: 6px; border: 1.5px solid transparent; font: 400 1.0625rem var(--sans); background: #fff; color: var(--ink); }
 .search-light { margin: 8px 0 18px; }
@@ -274,13 +271,12 @@ input:focus, select:focus, textarea:focus { border-color: var(--green); }
   .deals { grid-template-columns: repeat(2, 1fr); }
   .dash-stats { grid-template-columns: repeat(4, 1fr); }
   .band { flex-direction: row; align-items: center; justify-content: space-between; padding: 30px 32px; }
-  .sun { width: 620px; height: 620px; right: -60px; bottom: -330px; }
 }
 @media (min-width: 860px) {
   body, body.has-sticky { padding-bottom: 0; }
   .tabs { display: none; }
   .top-nav { display: flex; }
-  .hero-in { padding-top: 84px; padding-bottom: 96px; }
+  .hero-in { padding-top: 48px; padding-bottom: 52px; }
   .feat { display: grid; grid-template-columns: repeat(3, 1fr); overflow: visible; margin: 0; padding: 0; }
   .feat-card { max-width: none; }
   .quotes { grid-template-columns: repeat(3, 1fr); gap: 32px; }
@@ -292,6 +288,5 @@ input:focus, select:focus, textarea:focus { border-color: var(--green); }
   #toast { bottom: 28px; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .sun { animation: none; }
   * { transition: none !important; }
 }
