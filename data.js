@@ -1,30 +1,24 @@
-
 /* ------------------------------------------------------------------
    Mabvazuva Market: settings.
    This is the only file you need to edit.
 ------------------------------------------------------------------- */
-  supabaseUrl: "https://tduzkhfobaekauogqurw.supabase.co/rest/v1/",
-  supabaseKey: "sb_publishable_8G8RBazeZvwfG5LU8jp6iQ_DRhcAmaA",
-
-       adminWhatsApp: "0772 433 877",
-      paymentNote: "EcoCash 0772 433 877 (T. Masimo)",
 window.MM_CONFIG = {
   siteName: "Mabvazuva Market",
 
   // 1. DATABASE. Paste these two values from Supabase
   //    (Project Settings > API). While they are empty the site runs in
   //    preview mode with sample businesses saved on your own device only.
-  supabaseUrl: "",
-  supabaseKey: "",
-
+  supabaseUrl: "https://tduzkhfobaekauogqurw.supabase.co/rest/v1/",
+  supabaseKey: "sb_publishable_8G8RBazeZvwfG5LU8jp6iQ_DRhcAmaA",
   // 2. YOUR WHATSAPP, international format, digits only, e.g. "263771234567".
   //    New owners get a button to message you after they apply.
-  adminWhatsApp: "",
+  adminWhatsApp: "0772 433 877",
 
   // 3. HOW BUSINESSES PAY YOU, shown to owners who pick a paid plan,
   //    e.g. "EcoCash 0771 234 567 (T. Masimo), or cash at house 14."
   //    Leave empty and owners are told you will WhatsApp them the details.
-  paymentNote: "",
+  
+   paymentNote: "EcoCash 0772 433 877 (T. Masimo)",
 
   foundingSpots: 20,   // founding-member price for the first 20 paying businesses
   featuredSlots: 6,    // homepage feature slots (Premium only)
