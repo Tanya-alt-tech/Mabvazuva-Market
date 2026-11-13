@@ -1,8 +1,13 @@
+
 /* ------------------------------------------------------------------
    Mabvazuva Market: settings.
    This is the only file you need to edit.
 ------------------------------------------------------------------- */
+  supabaseUrl: "https://tduzkhfobaekauogqurw.supabase.co/rest/v1/",
+  supabaseKey: "sb_publishable_8G8RBazeZvwfG5LU8jp6iQ_DRhcAmaA",
 
+       adminWhatsApp: "0772 433 877",
+      paymentNote: "EcoCash 0772 433 877 (T. Masimo)",
 window.MM_CONFIG = {
   siteName: "Mabvazuva Market",
 
