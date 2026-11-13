@@ -8,7 +8,7 @@ window.MM_CONFIG = {
   // 1. DATABASE. Paste these two values from Supabase
   //    (Project Settings > API). While they are empty the site runs in
   //    preview mode with sample businesses saved on your own device only.
-  supabaseUrl: "https://tduzkhfobaekauogqurw.supabase.co/rest/v1/",
+   supabaseUrl: "https://tduzkhfobaekauogqurw.supabase.co",
   supabaseKey: "sb_publishable_8G8RBazeZvwfG5LU8jp6iQ_DRhcAmaA",
   // 2. YOUR WHATSAPP, international format, digits only, e.g. "263771234567".
   //    New owners get a button to message you after they apply.
