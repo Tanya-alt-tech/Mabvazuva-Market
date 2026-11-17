@@ -14,6 +14,16 @@ const catName = id => (CATS.find(c => c.id === id) || { name: 'Everything else' 
 const digits = n => { let d = String(n || '').replace(/\D/g, ''); if (d.length === 10 && d[0] === '0') d = '263' + d.slice(1); return d; };
 const waLink = (n, text) => 'https://wa.me/' + digits(n) + (text ? '?text=' + encodeURIComponent(text) : '');
 const siteUrl = () => location.href.split('#')[0];
+const ytId = u => { const m = String(u || '').match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|embed\/|live\/))([A-Za-z0-9_-]{11})/); return m ? m[1] : ''; };
+const SOCIALS = [['instagram', 'Instagram', 'https://www.instagram.com/'], ['facebook', 'Facebook', 'https://www.facebook.com/'], ['tiktok', 'TikTok', 'https://www.tiktok.com/@']];
+function socialUrl(kind, v) {
+  v = String(v || '').trim(); if (!v) return '';
+  const base = SOCIALS.find(x => x[0] === kind)[2];
+  const m = v.match(new RegExp('^(?:https?://)?(?:[a-z]+\\.)?' + kind + '\\.com/(.+)$', 'i'));
+  if (!m && /[\/:\s]/.test(v)) return '';
+  const h = (m ? m[1] : v).replace(/^@/, '').replace(/\/+$/, '');
+  return /^[\w.\-\/?=&%]+$/.test(h) ? base + h : '';
+}
 const uid = () => 'x' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const plural = (n, one, many) => n + ' ' + (n === 1 ? one : many);
 const ago = iso => {
@@ -295,6 +305,7 @@ function profile(parts) {
   const own = ME.user && (b.owner === ME.user.id || ME.admin);
   if (b.status === 'approved' && !own && !seen.has(b.id)) { seen.add(b.id); api.hit(b.id, 'view').catch(() => {}); }
   const revs = reviewsOf(b), canReview = b.plan !== 'starter';
+  const socials = b.plan === 'starter' ? [] : SOCIALS.map(x => [x[1], socialUrl(x[0], b[x[0]])]).filter(x => x[1]);
   const hello = `Hi ${b.name}, I found you on ${C.siteName}.`;
   const share = 'https://wa.me/?text=' + encodeURIComponent(`${b.name} on ${C.siteName}: ${b.tagline} ${siteUrl()}#/b/${b.id}`);
   const waBtn = b.wa
@@ -314,6 +325,7 @@ function profile(parts) {
   <div class="wrap page pro">
     ${b.status !== 'approved' ? `<p class="notice">This listing is ${b.status === 'pending' ? 'waiting for approval' : 'not approved'}. Only you can see it.</p>` : ''}
     ${b.photos && b.photos.length ? `<div class="gallery">${b.photos.map(p => `<img src="${esc(p)}" alt="Photo from ${esc(b.name)}" loading="lazy">`).join('')}</div>` : ''}
+    ${b.plan === 'premium' && ytId(b.video) ? `<div class="video${/shorts\//.test(b.video) ? ' video-tall' : ''}"><iframe src="https://www.youtube-nocookie.com/embed/${ytId(b.video)}" title="Video from ${esc(b.name)}" loading="lazy" allow="encrypted-media; picture-in-picture" allowfullscreen></iframe></div>` : ''}
     ${b.deal && b.plan !== 'starter' ? `<div class="deal deal-wide"><span class="deal-text">${esc(b.deal)}</span><span class="deal-by">Current deal</span></div>` : ''}
     <div class="pro-grid">
       <div>
@@ -332,6 +344,7 @@ function profile(parts) {
       <aside>
         ${(b.prices || []).length ? `<section><h2>Prices</h2><table class="prices">${b.prices.map(p => `<tr><td>${esc(p[0])}</td><td>${esc(p[1])}</td></tr>`).join('')}</table></section>` : ''}
         ${b.hours ? `<section><h2>Hours</h2><p>${esc(b.hours)}</p></section>` : ''}
+        ${socials.length ? `<section><h2>Find us on</h2><p class="socials">${socials.map(x => `<a class="btn btn-line btn-small" href="${esc(x[1])}" target="_blank" rel="noopener">${x[0]}</a>`).join('')}</p></section>` : ''}
         <p><a class="btn btn-line" href="${share}" target="_blank" rel="noopener">Share with a neighbour</a></p>
       </aside>
     </div>
@@ -519,9 +532,9 @@ async function dashboard(parts, params) {
     ${paid ? `<section><h2>WhatsApp clicks, last 4 weeks</h2>
       <div class="bars">${st.wa.map((n, i) => `<div class="bar"><span class="bar-n">${n}</span><span class="bar-fill" style="height:${Math.round(n / max * 100)}%"></span><span class="bar-l">${labels[i]}</span></div>`).join('')}</div></section>`
       : `<section class="upsell"><h2>${st.view[3]} ${st.view[3] === 1 ? 'neighbour' : 'neighbours'} looked at your listing this week.</h2>
-          <p>How many tapped WhatsApp? On Starter you cannot see that, and paid listings sit above yours in every search. Growth shows you clicks week by week, lets you post deals and collect reviews.</p>
+          <p>How many tapped WhatsApp? On Starter you cannot see that, and paid listings sit above yours in every search. Growth shows you clicks week by week, lets you post deals, collect reviews and link your Instagram, Facebook and TikTok.</p>
           <form data-form="plan" data-id="${esc(b.id)}"><input type="hidden" name="plan" value="growth"><button class="btn btn-brass" type="submit">Ask for Growth, $${priceNow('growth')} a month</button></form></section>`}
-    ${b.plan === 'growth' && pos > 1 ? `<section class="upsell"><h2>You are number ${pos} in ${esc(catName(b.cat))}.</h2><p>Premium listings always show first, and get a homepage feature slot and the Verified resident badge.</p>
+    ${b.plan === 'growth' && pos > 1 ? `<section class="upsell"><h2>You are number ${pos} in ${esc(catName(b.cat))}.</h2><p>Premium listings always show first, and get a homepage feature slot, a business video and the Verified resident badge.</p>
       <form data-form="plan" data-id="${esc(b.id)}"><input type="hidden" name="plan" value="premium"><button class="btn btn-brass" type="submit">Ask for Premium, $${priceNow('premium')} a month</button></form></section>` : ''}
 
     <section><h2>Bring your own customers</h2>
@@ -543,6 +556,10 @@ async function dashboard(parts, params) {
         ${field('Prices', `<textarea name="prices" rows="4" placeholder="Exterior wash - $5">${esc((b.prices || []).map(x => x[0] + ' - ' + x[1]).join('\n'))}</textarea>`, 'One per line, as: item - price')}
         <div class="two">${field('Opening hours', `<input name="hours" maxlength="120" value="${esc(b.hours)}">`)}${field('WhatsApp number', `<input name="wa" required inputmode="tel" value="${esc(b.wa)}">`)}</div>
         ${field('Your name', `<input name="owner_name" maxlength="60" value="${esc(b.owner_name)}">`)}
+        ${paid ? `<div class="two">${field('Instagram', `<input name="instagram" maxlength="200" value="${esc(b.instagram)}" placeholder="@yourbusiness">`)}${field('Facebook', `<input name="facebook" maxlength="200" value="${esc(b.facebook)}" placeholder="Page name or link">`)}</div>
+          ${field('TikTok', `<input name="tiktok" maxlength="200" value="${esc(b.tiktok)}" placeholder="@yourbusiness">`, 'Shown as buttons on your listing. Leave any of them empty.')}`
+          : '<p class="muted">Growth and Premium listings can also link their Instagram, Facebook and TikTok.</p>'}
+        ${b.plan === 'premium' ? field('Business video', `<input name="video" maxlength="200" value="${esc(b.video)}" placeholder="YouTube link">`, `A short video, up to 30 seconds, plays at the top of your listing.${C.adminWhatsApp ? ` Send the clip to the admin on WhatsApp and it will be put up for you.` : ''}`) : ''}
         ${paid ? field('Current deal', `<input name="deal" maxlength="200" value="${esc(b.deal)}" placeholder="e.g. First wash free on a monthly plan">`, 'Shown on the homepage and the deals page. Leave empty for no deal.') : ''}
         <button class="btn btn-green" type="submit">Save changes</button>
       </form></section>
@@ -659,6 +676,11 @@ const forms = {
     const prices = val(fd, 'prices').split('\n').map(l => l.trim()).filter(Boolean).map(l => { const i = l.lastIndexOf(' - '); return i < 0 ? [l, ''] : [l.slice(0, i).trim(), l.slice(i + 3).trim()]; }).slice(0, 20);
     const p = { name: val(fd, 'name'), cat: val(fd, 'cat'), tagline: val(fd, 'tagline'), descr: val(fd, 'descr'), prices, hours: val(fd, 'hours'), wa: digits(val(fd, 'wa')), owner_name: val(fd, 'owner_name') };
     if (fd.has('deal')) p.deal = val(fd, 'deal');
+    for (const s of SOCIALS) if (fd.has(s[0])) {
+      p[s[0]] = val(fd, s[0]);
+      if (p[s[0]] && !socialUrl(s[0], p[s[0]])) return toast(`That ${s[1]} entry does not look right. Use your @name or the link to your page.`);
+    }
+    if (fd.has('video')) { p.video = val(fd, 'video'); if (p.video && !ytId(p.video)) return toast('Paste the YouTube link to the video, for example https://youtu.be/...'); }
     await api.updateBiz(f.dataset.id, p); toast('Changes saved.'); await refresh();
   },
   async plan(fd, f) {
