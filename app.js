@@ -4,7 +4,9 @@
 
 const C = window.MM_CONFIG, CATS = window.MM_CATEGORIES, SAMPLE = window.MM_SAMPLE;
 const LIVE = !!(C.supabaseUrl && C.supabaseKey);
-const sb = LIVE && window.supabase ? window.supabase.createClient(C.supabaseUrl, C.supabaseKey) : null;
+const RECOVERY = /(^|[#&])type=recovery(&|$)/.test(location.hash);
+const LINK_ERROR = /(^|[#&])error_code=/.test(location.hash);
+const sb = LIVE && window.supabase ? window.supabase.createClient(C.supabaseUrl, C.supabaseKey, { auth: { flowType: 'implicit' } }) : null;
 
 const $ = (s, r) => (r || document).querySelector(s);
 const app = $('#app');
@@ -71,6 +73,9 @@ const local = {
   async signUp(email) { S.user = { id: 'local', email }; persist(); await this.session(); return true; },
   async signIn(email) { S.user = { id: 'local', email }; persist(); await this.session(); },
   async signOut() { S.user = null; persist(); await this.session(); },
+  async sendReset() { return 'preview'; },
+  async setPassword() { if (!S.user) throw new Error('This reset link has expired. Ask for a new one.'); },
+  async adminSetPassword() { },
   async createBiz(o) {
     const b = Object.assign({ id: uid(), owner: 'local', plan: 'starter', status: 'pending', paid: false, verified: false, featured: false, photos: [], prices: [], deal: '', created_at: new Date().toISOString() }, o);
     S.biz.unshift(b); persist(); return b;
@@ -115,6 +120,17 @@ const live = {
   async signUp(email, pw) { const d = ok(await sb.auth.signUp({ email, password: pw })); await this.session(); return !!(d && d.session); },
   async signIn(email, pw) { ok(await sb.auth.signInWithPassword({ email, password: pw })); await this.session(); },
   async signOut() { await sb.auth.signOut(); await this.session(); },
+  async sendReset(email) {
+    const r = await sb.auth.resetPasswordForEmail(email, { redirectTo: siteUrl() });
+    if (!r.error) return 'sent';
+    if (/not authori[sz]ed|rate limit|smtp|sending/i.test(r.error.message || '')) return 'no-email';
+    throw new Error(r.error.message);
+  },
+  async setPassword(pw) {
+    if (!ME.user) throw new Error('This reset link has expired. Ask for a new one.');
+    ok(await sb.auth.updateUser({ password: pw }));
+  },
+  async adminSetPassword(email, pw) { ok(await sb.rpc('admin_set_password', { p_email: email, p_password: pw })); },
   async createBiz(o) { return ok(await sb.from('businesses').insert(o).select().single()); },
   async updateBiz(id, p) { ok(await sb.from('businesses').update(p).eq('id', id)); },
   async deleteBiz(id) { ok(await sb.from('businesses').delete().eq('id', id)); },
@@ -161,7 +177,7 @@ const featuredList = () => approved().filter(b => b.featured && b.plan === 'prem
 let toastTimer;
 function toast(msg) {
   const t = $('#toast'); t.textContent = msg; t.classList.add('show');
-  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 4200);
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), Math.max(4200, msg.length * 90));
 }
 const mono = name => name.replace(/[^A-Za-z0-9 ]/g, '').split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0].toUpperCase()).join('');
 const plaque = (b, cls) => b.photos && b.photos.length
@@ -200,22 +216,27 @@ function home() {
   const counts = {}; list.forEach(b => { counts[b.cat] = (counts[b.cat] || 0) + 1; });
 
   return `
-  <section class="hero">
-    <div class="sun" aria-hidden="true"></div>
+  <section class="hero hero-photo">
     <div class="wrap hero-in">
-      <h1>Everything you need is already inside the gate.</h1>
-      <p class="hero-sub">${list.length ? `${plural(list.length, 'Mabvazuva business', 'Mabvazuva businesses')}, from piano lessons to plumbing.` : 'The directory of Mabvazuva businesses, from piano lessons to plumbing.'} Find one, tap once, chat on WhatsApp.</p>
+      <p class="greet">${greeting()}, Mabvazuva</p>
+      <h1>Welcome home. Everything you need is inside the gate.</h1>
+      <p class="hero-sub">Bakers, tutors, plumbers and stylists, run by your neighbours and the people they trust. Find one, tap once, chat on WhatsApp.</p>
       <form class="search" data-form="search" role="search">
         <label class="sr" for="q">What do you need today?</label>
         <input id="q" name="q" type="search" placeholder="What do you need today?" autocomplete="off">
         <button class="btn btn-brass" type="submit">Search</button>
       </form>
       <p class="quick">${window.MM_QUICK.map(q => `<a href="#/browse?q=${encodeURIComponent(q)}">${esc(q)}</a>`).join('')}</p>
+      ${list.length >= 5 ? `<dl class="hero-stats">
+        <div><dt>${list.length}</dt><dd>businesses listed</dd></div>
+        ${totalContacts ? `<div><dt>${totalContacts}</dt><dd>${totalContacts === 1 ? 'neighbour' : 'neighbours'} made contact this week</dd></div>` : ''}
+        ${list.filter(b => b.verified).length ? `<div><dt>${list.filter(b => b.verified).length}</dt><dd>run by verified residents</dd></div>` : ''}
+      </dl>` : ''}
     </div>
   </section>
 
   <div class="wrap">
-    ${totalContacts ? `<p class="pulse">${plural(totalContacts, 'neighbour', 'neighbours')} contacted a Mabvazuva business through this site in the last 7 days.</p>` : ''}
+    ${totalContacts && list.length < 5 ? `<p class="pulse">${plural(totalContacts, 'neighbour', 'neighbours')} contacted a Mabvazuva business through this site in the last 7 days.</p>` : ''}
 
     <section class="sec">
       ${head('Browse by what you need', '#/browse', 'See everything')}
@@ -268,6 +289,10 @@ function home() {
   </div>`;
 }
 
+function greeting() {
+  const h = new Date().getHours();
+  return h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening';
+}
 const dealCard = b => `<a class="deal" href="#/b/${esc(b.id)}"><span class="deal-text">${esc(b.deal)}</span><span class="deal-by">${esc(b.name)}</span></a>`;
 
 function browse(parts, params) {
@@ -488,7 +513,13 @@ function account(parts, params) {
       <p class="lead">Signed in as ${esc(ME.user.email)}.</p>
       ${m.length ? `<div class="rows">${m.map(b => `<a class="row" href="#/dashboard?id=${esc(b.id)}">${plaque(b)}<span class="row-main"><span class="row-name">${esc(b.name)}</span><span class="row-meta">${statusText(b)}</span></span></a>`).join('')}</div>`
         : '<p>You have no listing yet. <a href="#/join">List your business</a>.</p>'}
-      <p>${ME.admin ? '<a class="btn btn-green" href="#/admin">Open admin</a> ' : ''}<button class="btn btn-line" type="button" data-act="signout">Sign out</button></p></div>`;
+      <p>${ME.admin ? '<a class="btn btn-green" href="#/admin">Open admin</a> ' : ''}<button class="btn btn-line" type="button" data-act="signout">Sign out</button></p>
+      <details class="add-review"><summary>Change password</summary>
+        <form data-form="newpass">
+          ${field('New password', '<input name="password" type="password" required minlength="6" autocomplete="new-password">', 'At least 6 characters.')}
+          ${field('Type it again', '<input name="password2" type="password" required minlength="6" autocomplete="new-password">')}
+          <button class="btn btn-green" type="submit">Save new password</button>
+        </form></details></div>`;
   }
   const isNewAcc = params.get('mode') === 'new';
   return `<div class="wrap page narrow"><h1>${isNewAcc ? 'Create an account' : 'Sign in'}</h1>
@@ -498,6 +529,7 @@ function account(parts, params) {
       ${field('Password', `<input name="password" type="password" required minlength="6" autocomplete="${isNewAcc ? 'new-password' : 'current-password'}">`)}
       <button class="btn btn-green" type="submit">${isNewAcc ? 'Create account' : 'Sign in'}</button>
     </form>
+    ${isNewAcc ? '' : '<p><a href="#/forgot">Forgot your password?</a></p>'}
     <p class="muted">${isNewAcc ? 'Already registered? <a href="#/account">Sign in</a>.' : 'New here? <a href="#/join">List your business</a> and your login is created on the way, or <a href="#/account?mode=new">create an account</a>.'}</p></div>`;
 }
 
@@ -610,16 +642,60 @@ function admin() {
         ${field('Details', '<input name="detail" maxlength="200">')}<button class="btn btn-green" type="submit">Add event</button></form>
       <ul class="adm-list">${DB.events.map(e => `<li>${esc(e.date_text)}: ${esc(e.title)} <button type="button" class="link danger" data-act="adm-del" data-kind="Event" data-id="${esc(e.id)}">Remove</button></li>`).join('')}</ul></section>
 
+    <section><h2>Reset an owner's password</h2>
+      <p class="muted">When an owner forgets their password, set a temporary one here and send it to them on WhatsApp. They can change it from their Account page after signing in.</p>
+      <form class="card-form" data-form="adm-pass"><div class="two">
+        ${field("Owner's login email", '<input name="email" type="email" required autocomplete="off">')}
+        ${field('Temporary password', `<input name="password" required minlength="6" autocomplete="off" value="${tempPass()}">`, 'Already filled in for you. Change it if you like.')}
+      </div><button class="btn btn-green" type="submit">Set password</button></form></section>
+
     <section><h2>Requests</h2><ul class="adm-list">${DB.requests.map(r => `<li>${esc(r.name)}: ${esc(r.need)} <button type="button" class="link danger" data-act="adm-del" data-kind="Request" data-id="${esc(r.id)}">Remove</button></li>`).join('') || '<li class="muted">None.</li>'}</ul></section>
 
     <section><h2>Reviews</h2><ul class="adm-list">${DB.reviews.map(r => `<li>${'★'.repeat(r.stars)} ${esc(r.name)} on ${esc((byId(r.business_id) || {}).name || 'deleted business')}: ${esc(r.body)} <button type="button" class="link danger" data-act="adm-del" data-kind="Review" data-id="${esc(r.id)}">Remove</button></li>`).join('') || '<li class="muted">None.</li>'}</ul></section>
   </div>`;
 }
 
+const adminHelp = (email) => C.adminWhatsApp
+  ? `<a class="btn btn-wa" href="${waLink(C.adminWhatsApp, `Hi, I have forgotten my ${C.siteName} password.${email ? ' My login email is ' + email + '.' : ''}`)}" target="_blank" rel="noopener">Ask the admin on WhatsApp</a>`
+  : '';
+function forgot(parts, params) {
+  const st = params.get('s'), email = params.get('e') || '';
+  if (st === 'sent') return `<div class="wrap page narrow"><div class="done-box"><h1>Check your email.</h1>
+    <p>If ${email ? esc(email) : 'that address'} has an account, a link to set a new password is on its way. It can take a few minutes, so check your spam folder too.</p>
+    <p>No email after ten minutes? The admin can reset it for you.</p><p>${adminHelp(email)}</p></div></div>`;
+  if (st === 'no-email' || st === 'preview') return `<div class="wrap page narrow"><div class="done-box"><h1>The admin will reset it for you.</h1>
+    <p>${st === 'preview' ? 'Reset emails are not sent in preview mode.' : 'Password emails are not switched on yet.'} Message the admin on WhatsApp with your login email and you will get a new password back, usually the same day.</p>
+    <p>${adminHelp(email)}</p></div></div>`;
+  return `<div class="wrap page narrow"><h1>Forgot your password?</h1>
+    ${params.get('expired') ? '<p class="notice">That reset link has expired or was already used. Ask for a new one below.</p>' : ''}
+    <p class="lead">Enter the email you signed up with and we will send you a link to set a new password.</p>
+    <form data-form="forgot">
+      ${field('Email', '<input name="email" type="email" required autocomplete="email">')}
+      <button class="btn btn-green" type="submit">Send reset link</button>
+    </form>
+    ${C.adminWhatsApp ? `<p class="muted">Or <a href="${waLink(C.adminWhatsApp, `Hi, I have forgotten my ${C.siteName} password.`)}" target="_blank" rel="noopener">message the admin on WhatsApp</a> and they will reset it for you.</p>` : ''}</div>`;
+}
+function resetPage() {
+  if (!ME.user) return `<div class="wrap page narrow"><h1>This link has expired.</h1>
+    <p class="lead">Reset links only work once and only for a short time.</p><p><a class="btn btn-green" href="#/forgot">Ask for a new link</a></p></div>`;
+  return `<div class="wrap page narrow"><h1>Set a new password</h1>
+    <p class="lead">For ${esc(ME.user.email)}.</p>
+    <form data-form="newpass">
+      ${field('New password', '<input name="password" type="password" required minlength="6" autocomplete="new-password">', 'At least 6 characters.')}
+      ${field('Type it again', '<input name="password2" type="password" required minlength="6" autocomplete="new-password">')}
+      <button class="btn btn-green" type="submit">Save new password</button>
+    </form></div>`;
+}
+
+function tempPass() {
+  const words = ['sun', 'gate', 'cake', 'rose', 'park', 'lion', 'wave', 'star', 'moon', 'leaf'];
+  const r = n => Math.floor(Math.random() * n);
+  return words[r(words.length)] + (1000 + r(9000)) + words[r(words.length)];
+}
 const notFound = () => `<div class="wrap page narrow"><h1>That page is not here.</h1><p><a class="btn btn-green" href="#/">Back to the directory</a></p></div>`;
 
 /* ---------------- router ---------------- */
-const routes = { '': home, browse, b: profile, requests: requestsPage, deals: dealsPage, pricing, join, account, dashboard, admin };
+const routes = { '': home, browse, b: profile, requests: requestsPage, deals: dealsPage, pricing, join, account, dashboard, admin, forgot, reset: resetPage };
 async function render(keepScroll) {
   const h = location.hash.replace(/^#\/?/, ''), cut = h.indexOf('?');
   const path = cut < 0 ? h : h.slice(0, cut), params = new URLSearchParams(cut < 0 ? '' : h.slice(cut + 1));
@@ -657,6 +733,22 @@ const forms = {
     J.step = 4; await api.load(); go('#/join');
   },
   async signin(fd) { await api.signIn(val(fd, 'email'), val(fd, 'password')); await afterSignIn(); },
+  async forgot(fd) {
+    const email = val(fd, 'email'), r = await api.sendReset(email);
+    go('#/forgot?' + new URLSearchParams({ s: r, e: email }).toString());
+  },
+  async newpass(fd, f) {
+    if (val(fd, 'password') !== val(fd, 'password2')) return toast('The two passwords do not match.');
+    await api.setPassword(val(fd, 'password'));
+    f.reset(); toast('New password saved.');
+    if (location.hash.indexOf('#/reset') === 0) go(mine().length ? '#/dashboard' : '#/account');
+  },
+  async 'adm-pass'(fd, f) {
+    const email = val(fd, 'email'), pw = val(fd, 'password');
+    await api.adminSetPassword(email, pw);
+    f.querySelector('[name=email]').value = ''; f.querySelector('[name=password]').value = tempPass();
+    toast(`Password for ${email} is now ${pw}. Send it to them on WhatsApp.`);
+  },
   async signup(fd) {
     const has = await api.signUp(val(fd, 'email'), val(fd, 'password'));
     if (!has) return toast('Check your email for a confirmation link, then sign in.');
@@ -758,6 +850,8 @@ const nice = e => {
   if (/already registered/i.test(m)) return 'That email already has an account. Sign in instead.';
   if (/invalid login/i.test(m)) return 'Wrong email or password.';
   if (/not confirmed/i.test(m)) return 'Confirm your email first. Check your inbox for the link.';
+  if (/no account with that email/i.test(m)) return 'No account uses that email. Check the spelling.';
+  if (/should be different/i.test(m)) return 'Choose a password you have not used before.';
   return m;
 };
 document.addEventListener('submit', async e => {
@@ -786,6 +880,9 @@ window.addEventListener('hashchange', () => render());
       $('#ribbon').innerHTML = `<div class="ribbon"><span>Preview mode: sample businesses, saved on this device only. Connect the database to go live.</span> <button type="button" data-act="preview-reset">Reset preview</button></div>`;
     }
     await api.session(); await api.load();
+    const clean = h => history.replaceState(null, '', location.pathname + location.search + h);
+    if (RECOVERY) clean('#/reset');
+    else if (LINK_ERROR) clean('#/forgot?expired=1');
   } catch (e) { toast(nice(e)); }
   render();
 })();
