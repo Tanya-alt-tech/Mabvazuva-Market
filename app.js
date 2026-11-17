@@ -236,6 +236,7 @@ function home() {
   </section>
 
   <div class="wrap">
+    <div id="install-slot"></div>
     ${totalContacts && list.length < 5 ? `<p class="pulse">${plural(totalContacts, 'neighbour', 'neighbours')} contacted a Mabvazuva business through this site in the last 7 days.</p>` : ''}
 
     <section class="sec">
@@ -692,6 +693,24 @@ function tempPass() {
   const r = n => Math.floor(Math.random() * n);
   return words[r(words.length)] + (1000 + r(9000)) + words[r(words.length)];
 }
+/* ---------------- add to home screen ---------------- */
+let installEvt = null;
+const standalone = () => (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
+const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+function fillInstall() {
+  const slot = document.getElementById('install-slot'); if (!slot) return;
+  if (standalone() || ls.get('mm_install_hidden')) { slot.innerHTML = ''; return; }
+  const close = '<button type="button" class="link install-x" data-act="install-hide" aria-label="Hide this">Not now</button>';
+  if (installEvt) slot.innerHTML = `<div class="install"><div><strong>Get ${esc(C.siteName)} on your phone</strong><p>One tap from your home screen, like any other app. Free, and no app store needed.</p></div><p class="install-acts"><button class="btn btn-green" type="button" data-act="install">Add to home screen</button>${close}</p></div>`;
+  else if (isIOS()) slot.innerHTML = `<div class="install"><div><strong>Get ${esc(C.siteName)} on your iPhone</strong><p>In Safari, tap the Share button <span aria-hidden="true">(the square with an arrow)</span>, then <em>Add to Home Screen</em>.</p></div><p class="install-acts">${close}</p></div>`;
+  else slot.innerHTML = '';
+}
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; fillInstall(); });
+window.addEventListener('appinstalled', () => { installEvt = null; fillInstall(); toast(`${C.siteName} is on your home screen.`); });
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+}
+
 const notFound = () => `<div class="wrap page narrow"><h1>That page is not here.</h1><p><a class="btn btn-green" href="#/">Back to the directory</a></p></div>`;
 
 /* ---------------- router ---------------- */
@@ -707,6 +726,7 @@ async function render(keepScroll) {
   $('#nav-account').textContent = ME.user ? 'Account' : 'Sign in';
   $('#foot-admin').hidden = !ME.admin;
   document.body.classList.toggle('has-sticky', !!$('.sticky-wa'));
+  fillInstall();
   document.title = ($('#app h1') ? $('#app h1').textContent + ' | ' : '') + C.siteName;
   if (!keepScroll) window.scrollTo(0, 0);
 }
@@ -817,6 +837,13 @@ const acts = {
     await api.deleteBiz(t.dataset.id); toast('Listing deleted.'); await refresh();
   },
   async 'adm-del'(t) { await api['delete' + t.dataset.kind](t.dataset.id); toast(t.dataset.kind + ' removed.'); await refresh(); },
+  async install() {
+    if (!installEvt) return;
+    installEvt.prompt();
+    try { await installEvt.userChoice; } catch (e) { /* closed */ }
+    installEvt = null; fillInstall();
+  },
+  'install-hide'() { ls.set('mm_install_hidden', 1); fillInstall(); },
   'preview-reset'() { ls.del(PKEY); S = seed(); persist(); api.session().then(refresh); toast('Preview reset to the sample data.'); }
 };
 const changes = {
