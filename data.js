@@ -24,12 +24,12 @@ window.MM_CONFIG = {
   featuredSlots: 6,    // homepage feature slots (Premium only)
 
   plans: {
-    premium: { name: "Premium", price: 25, founding: 18, photos: 8,
+        premium: { name: "Premium", price: 25, founding: 20, photos: 8,
       line: "Be the first name neighbours see.",
-      features: ["Homepage feature slot", "Top of every search", "Verified resident badge", "Everything in Growth"] },
-    growth:  { name: "Growth", price: 10, founding: 7, photos: 8,
+      features: ["Business video on your listing", "Homepage feature slot", "Top of every search", "Verified resident badge", "8 photos and everything in Growth"] },
+    growth:  { name: "Growth", price: 12, founding: 10, photos: 4,
       line: "Everything a busy local business needs.",
-      features: ["Up to 8 photos", "Post deals", "Collect reviews", "Weekly views and WhatsApp clicks", "Listed above Starter"] },
+      features: ["Instagram, Facebook and TikTok links", "Up to 4 photos", "Post deals", "Collect reviews", "Weekly views and WhatsApp clicks", "Listed above Starter"] },
     starter: { name: "Starter", price: 0, founding: 0, photos: 1,
       line: "Get found. Free, for as long as you like.",
       features: ["Full listing with prices and hours", "1 photo", "WhatsApp button"] }
