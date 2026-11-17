@@ -3,7 +3,7 @@
    This is the only file you need to edit.
 ------------------------------------------------------------------- */
 window.MM_CONFIG = {
-  siteName: "Mabvazuva Market",
+  siteName: "Vazuva",
 
   // 1. DATABASE. Paste these two values from Supabase
   //    (Project Settings > API). While they are empty the site runs in
