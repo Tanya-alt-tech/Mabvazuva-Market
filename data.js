@@ -18,7 +18,7 @@ window.MM_CONFIG = {
   //    e.g. "EcoCash 0771 234 567 (T. Masimo), or cash at house 14."
   //    Leave empty and owners are told you will WhatsApp them the details.
   
-   paymentNote: "EcoCash 0772 433 877 (T. Masimo)",
+   paymentNote: "EcoCash 0772 433 877 (W. Magwenzi).",
 
   foundingSpots: 20,   // founding-member price for the first 20 paying businesses
   featuredSlots: 6,    // homepage feature slots (Premium only)
