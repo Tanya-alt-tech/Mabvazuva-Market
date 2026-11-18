@@ -34,7 +34,11 @@ const ago = iso => {
   if (d < 60) return Math.floor(d / 7) + ' weeks ago'; return Math.floor(d / 30) + ' months ago';
 };
 
-let DB = { all: [], reviews: [], requests: [], events: [], counts: {} };
+let DB = { all: [], reviews: [], requests: [], events: [], counts: {}, payments: [], reports: [] };
+const PLAN_DAYS = 30, REMIND_DAYS = 5;
+const fmtDate = iso => new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+const daysLeft = b => b.paid_until ? Math.ceil((new Date(b.paid_until).getTime() - Date.now()) / DAY) : null;
+const reporterKey = () => { let k = ls.get('mm_reporter'); if (!k) { k = 'r' + Math.random().toString(36).slice(2) + Date.now().toString(36); ls.set('mm_reporter', k); } return k; };
 let ME = { user: null, admin: false };
 
 /* ---------------- storage helpers ---------------- */
@@ -51,7 +55,8 @@ function seed() {
   const now = Date.now(), iso = d => new Date(now - d * DAY).toISOString();
   const s = { user: null, biz: [], reviews: [], requests: [], events: [], hits: {} };
   SAMPLE.businesses.forEach(b => {
-    const o = Object.assign({}, b, { owner: 'sample', status: 'approved', requested_plan: b.plan, photos: [], created_at: iso(b.daysAgo) });
+    const o = Object.assign({}, b, { owner: 'sample', status: 'approved', requested_plan: b.plan, photos: [], created_at: iso(b.daysAgo), review_note: '', lapsed_plan: '',
+      paid_until: b.plan !== 'starter' && b.paid ? new Date(now + (3 + (s.biz.length * 7) % 26) * DAY).toISOString() : null });
     delete o.reviews; delete o.hits; delete o.daysAgo;
     s.biz.push(o);
     s.hits[b.id] = { view: b.hits.view.slice(), wa: b.hits.wa.slice() };
@@ -60,12 +65,28 @@ function seed() {
   s.reviews.sort((a, b) => a.created_at < b.created_at ? 1 : -1);
   s.requests = SAMPLE.requests.map(r => Object.assign({}, r, { wa: '', created_at: iso(r.daysAgo) }));
   s.events = SAMPLE.events.map(e => Object.assign({}, e));
+  s.payments = []; s.reports = [];
   return s;
 }
 const persist = () => ls.set(PKEY, S);
+function localReview(b) {   // same checks the database runs
+  const others = S.biz.filter(x => x.id !== b.id && x.status !== 'rejected');
+  if (String(b.tagline || '').trim().length < 5) return 'The one-line summary is missing or very short.';
+  if (!/^2637\d{8}$/.test(b.wa || '')) return 'The WhatsApp number is not a Zimbabwean mobile number.';
+  if (others.some(x => x.name.trim().toLowerCase() === String(b.name).trim().toLowerCase())) return 'Another listing already uses this name.';
+  if (others.some(x => x.wa === b.wa && x.owner !== b.owner)) return 'Another owner already uses this WhatsApp number.';
+  if (S.biz.some(x => x.owner === b.owner && x.status === 'rejected')) return 'This owner has had a listing rejected before.';
+  return '';
+}
 const local = {
   async session() { ME.user = S.user; ME.admin = !!S.user; },
   async load() {
+    S.payments = S.payments || []; S.reports = S.reports || [];
+    const now = Date.now();
+    S.biz.forEach(b => { if (b.plan !== 'starter' && b.paid_until && new Date(b.paid_until).getTime() < now) Object.assign(b, { lapsed_plan: b.plan, plan: 'starter', paid: false, featured: false, deal: '' }); });
+    S.requests = S.requests.filter(r => now - new Date(r.created_at).getTime() < 14 * DAY);
+    persist();
+    DB.payments = S.payments.slice().sort((a, b) => a.created_at < b.created_at ? 1 : -1); DB.reports = S.reports.slice();
     DB.all = S.biz.slice(); DB.reviews = S.reviews.slice(); DB.events = S.events.slice();
     DB.requests = S.requests.map(r => { const c = Object.assign({}, r); delete c.wa; return c; });
     DB.counts = {}; S.biz.forEach(b => { DB.counts[b.id] = (S.hits[b.id] || { wa: [0, 0, 0, 0] }).wa[3]; });
@@ -77,10 +98,38 @@ const local = {
   async setPassword() { if (!S.user) throw new Error('This reset link has expired. Ask for a new one.'); },
   async adminSetPassword() { },
   async createBiz(o) {
-    const b = Object.assign({ id: uid(), owner: 'local', plan: 'starter', status: 'pending', paid: false, verified: false, featured: false, photos: [], prices: [], deal: '', created_at: new Date().toISOString() }, o);
+    const b = Object.assign({ id: uid(), owner: 'local', plan: 'starter', paid: false, verified: false, featured: false, photos: [], prices: [], deal: '', paid_until: null, lapsed_plan: '', created_at: new Date().toISOString() }, o);
+    const problem = localReview(b);
+    b.status = problem ? 'pending' : 'approved'; b.review_note = problem;
     S.biz.unshift(b); persist(); return b;
   },
-  async updateBiz(id, p) { Object.assign(S.biz.find(b => b.id === id), p); persist(); },
+  async claimPayment(o) {
+    if (S.payments.some(p => p.business_id === o.business_id && p.status === 'pending')) throw new Error('duplicate key value violates unique constraint "payments_one_pending"');
+    S.payments.unshift(Object.assign({ id: uid(), owner: 'local', status: 'pending', created_at: new Date().toISOString() }, o)); persist();
+  },
+  async confirmPayment(id, good) {
+    const p = S.payments.find(x => x.id === id && x.status === 'pending'); if (!p) throw new Error('That payment was already handled.');
+    p.status = good ? 'confirmed' : 'rejected';
+    if (good) this.extendLocal(p.business_id, p.plan);
+    persist();
+  },
+  extendLocal(id, plan) {
+    const b = S.biz.find(x => x.id === id), from = Math.max(Date.now(), b.paid_until ? new Date(b.paid_until).getTime() : 0);
+    Object.assign(b, { plan, paid: true, lapsed_plan: '', paid_until: new Date(from + PLAN_DAYS * DAY).toISOString() });
+  },
+  async extend(id, plan) { if (!['growth', 'premium'].includes(plan)) throw new Error('Choose Growth or Premium first.'); this.extendLocal(id, plan); persist(); },
+  async report(id, reason) {
+    const key = reporterKey();
+    if (!S.reports.some(r => r.business_id === id && r.reporter === key)) S.reports.push({ id: uid(), business_id: id, reason, reporter: key, created_at: new Date().toISOString() });
+    const b = S.biz.find(x => x.id === id);
+    if (b && b.status === 'approved' && S.reports.filter(r => r.business_id === id).length >= 3) Object.assign(b, { status: 'pending', review_note: 'Hidden after reports from 3 people.' });
+    persist();
+  },
+  async updateBiz(id, p) {
+    const b = S.biz.find(x => x.id === id);
+    if (p.status === 'approved' && b.status !== 'approved') S.reports = S.reports.filter(r => r.business_id !== id);
+    Object.assign(b, p); persist();
+  },
   async deleteBiz(id) { S.biz = S.biz.filter(b => b.id !== id); persist(); },
   async addReview(o) { S.reviews.unshift(Object.assign({ id: uid(), created_at: new Date().toISOString() }, o)); persist(); },
   async deleteReview(id) { S.reviews = S.reviews.filter(r => r.id !== id); persist(); },
@@ -107,14 +156,18 @@ const live = {
     if (u) { const r = await sb.rpc('is_admin'); ME.admin = !r.error && r.data === true; }
   },
   async load() {
-    const [b, r, q, e, c] = await Promise.all([
+    await sb.rpc('housekeeping').then(() => {}, () => {});
+    const [b, r, q, e, c, p, rp] = await Promise.all([
       sb.from('businesses').select('*').order('created_at', { ascending: false }),
       sb.from('reviews').select('*').order('created_at', { ascending: false }),
       sb.from('requests').select('*').order('created_at', { ascending: false }),
       sb.from('events').select('*').order('created_at', { ascending: true }),
-      sb.rpc('public_counts')
+      sb.rpc('public_counts'),
+      ME.user ? sb.from('payments').select('*').order('created_at', { ascending: false }) : Promise.resolve({ data: [] }),
+      ME.admin ? sb.from('reports').select('*').order('created_at', { ascending: false }) : Promise.resolve({ data: [] })
     ]);
     DB.all = ok(b); DB.reviews = ok(r); DB.requests = ok(q); DB.events = ok(e);
+    DB.payments = p.error ? [] : p.data; DB.reports = rp.error ? [] : rp.data;
     DB.counts = {}; (ok(c) || []).forEach(x => { DB.counts[x.business_id] = Number(x.contacts); });
   },
   async signUp(email, pw) { const d = ok(await sb.auth.signUp({ email, password: pw })); await this.session(); return !!(d && d.session); },
@@ -132,6 +185,10 @@ const live = {
   },
   async adminSetPassword(email, pw) { ok(await sb.rpc('admin_set_password', { p_email: email, p_password: pw })); },
   async createBiz(o) { return ok(await sb.from('businesses').insert(o).select().single()); },
+  async claimPayment(o) { ok(await sb.from('payments').insert(o)); },
+  async confirmPayment(id, good) { ok(await sb.rpc('admin_confirm_payment', { p_id: id, p_ok: good })); },
+  async extend(id, plan) { ok(await sb.rpc('admin_extend', { p_id: id, p_plan: plan })); },
+  async report(id, reason) { ok(await sb.rpc('report_listing', { p_id: id, p_reason: reason, p_reporter: reporterKey() })); },
   async updateBiz(id, p) { ok(await sb.from('businesses').update(p).eq('id', id)); },
   async deleteBiz(id) { ok(await sb.from('businesses').delete().eq('id', id)); },
   async addReview(o) { ok(await sb.from('reviews').insert(o)); },
@@ -372,6 +429,13 @@ function profile(parts) {
         ${b.hours ? `<section><h2>Hours</h2><p>${esc(b.hours)}</p></section>` : ''}
         ${socials.length ? `<section><h2>Find us on</h2><p class="socials">${socials.map(x => `<a class="btn btn-line btn-small" href="${esc(x[1])}" target="_blank" rel="noopener">${x[0]}</a>`).join('')}</p></section>` : ''}
         <p><a class="btn btn-line" href="${share}" target="_blank" rel="noopener">Share with a neighbour</a></p>
+        ${b.status === 'approved' && !own ? ((ls.get('mm_reported') || {})[b.id] ? '<p class="muted">You reported this listing. Thank you, the admin will look into it.</p>'
+          : `<details class="report"><summary>Report this listing</summary>
+            <form data-form="report" data-id="${esc(b.id)}">
+              ${field('What is wrong?', `<select name="reason">${['Not in or near Mabvazuva', 'Wrong number, or never replies', 'Fake or spam', 'Rude, unsafe or a scam', 'Something else'].map(x => `<option>${x}</option>`).join('')}</select>`)}
+              ${field('Anything to add?', '<textarea name="detail" rows="2" maxlength="150"></textarea>', 'Optional. The business does not see who reported it.')}
+              <button class="btn btn-line" type="submit">Send report</button>
+            </form></details>`) : ''}
       </aside>
     </div>
   </div>
@@ -464,20 +528,21 @@ function join(parts, params) {
   const d = J.d;
   const steps = `<ol class="steps">${['Your business', 'How to reach you', 'Choose a plan'].map((s, i) => `<li class="${J.step === i + 1 ? 'on' : J.step > i + 1 ? 'done' : ''}">${s}</li>`).join('')}</ol>`;
   if (J.step === 4) {
-    const msg = `Hi, I have just listed "${J.d.name}" on ${C.siteName}${J.plan !== 'starter' ? ` and would like the ${C.plans[J.plan].name} plan` : ''}.`;
-    const paid = J.plan !== 'starter';
+    const live = J.status === 'approved', paidPick = J.plan !== 'starter';
+    const msg = `Hi, I have just listed "${J.d.name}" on ${C.siteName}.`;
     const html = `<div class="wrap page narrow"><div class="done-box">
-      <h1>Sent for approval.</h1>
-      <p>${esc(J.d.name)} will appear in the directory as soon as the admin has checked it, usually within a day.</p>
-      ${paid ? `<p>You chose ${C.plans[J.plan].name} at $${priceNow(J.plan)} a month. ${C.paymentNote ? esc(C.paymentNote) : 'The admin will WhatsApp you the payment details.'} Your listing starts on Starter and moves up once payment is in.</p>` : ''}
-      <p>${C.adminWhatsApp ? `<a class="btn btn-wa" href="${waLink(C.adminWhatsApp, msg)}" target="_blank" rel="noopener">Tell the admin on WhatsApp</a> ` : ''}<a class="btn btn-green" href="#/dashboard">Add photos and prices</a></p>
+      <h1>${live ? `${esc(J.d.name)} is live.` : 'Sent for approval.'}</h1>
+      <p>${live ? 'Neighbours can find it in the directory now. Add photos and prices so it stands out.' : `${esc(J.d.name)} will appear in the directory as soon as the admin has checked it, usually within a day.`}</p>
+      ${paidPick ? `<p>You chose ${C.plans[J.plan].name} at $${priceNow(J.plan)} a month. To switch it on, pay ${C.paymentNote ? esc(C.paymentNote.replace(/\.$/, '')) : 'the admin by EcoCash'}, then enter the transaction reference in your dashboard. It runs for ${PLAN_DAYS} days from when it is confirmed.</p>` : ''}
+      <p>${paidPick ? `<a class="btn btn-brass" href="#/dashboard?id=${esc(J.id)}&pay=${J.plan}">Enter my payment reference</a> ` : ''}<a class="btn btn-green" href="#/dashboard?id=${esc(J.id)}">Add photos and prices</a>
+      ${!live && C.adminWhatsApp ? ` <a class="btn btn-wa" href="${waLink(C.adminWhatsApp, msg)}" target="_blank" rel="noopener">Tell the admin on WhatsApp</a>` : ''}</p>
     </div></div>`;
     J = { step: 1, d: {}, plan: 'growth' };
     return html;
   }
   if (J.step === 5) {
     return `<div class="wrap page narrow"><div class="done-box"><h1>Check your email.</h1>
-      <p>We sent a confirmation link to your address. Open it, then sign in here and your listing will be sent for approval automatically.</p>
+      <p>We sent a confirmation link to your address. Open it, then sign in here and your listing will be added automatically.</p>
       <p><a class="btn btn-green" href="#/account">Sign in</a></p></div></div>`;
   }
   let body;
@@ -495,12 +560,12 @@ function join(parts, params) {
   else body = `<form data-form="join3">
       ${foundingNote()}
       <div class="plans plans-pick">${planCards('pick', J.plan)}</div>
-      <p class="muted">Nothing is charged now. Paid plans start once you pay the admin by EcoCash, bank transfer or cash.</p>
+      <p class="muted">Nothing is charged now. After listing, you can pay for Growth or Premium from your dashboard.</p>
       ${ME.user ? `<p class="muted">Listing as ${esc(ME.user.email)}.</p>` : `
         <h2>Create your login</h2>
         <p class="muted">So you can edit your listing later. Already have one? <a href="#/account">Sign in first</a>.</p>
         <div class="two">${field('Email', '<input name="email" type="email" required autocomplete="email">')}${field('Password', '<input name="password" type="password" required minlength="6" autocomplete="new-password">', 'At least 6 characters.')}</div>`}
-      <p class="form-nav"><button class="btn btn-line" type="button" data-act="join-back">Back</button> <button class="btn btn-brass" type="submit">Send my listing for approval</button></p></form>`;
+      <p class="form-nav"><button class="btn btn-line" type="button" data-act="join-back">Back</button> <button class="btn btn-brass" type="submit">List my business</button></p></form>`;
   return `<div class="wrap page ${J.step === 3 ? '' : 'narrow'}">
     <h1>List your business</h1>
     <p class="lead">Three short steps. Under two minutes.</p>
@@ -534,7 +599,8 @@ function account(parts, params) {
     <p class="muted">${isNewAcc ? 'Already registered? <a href="#/account">Sign in</a>.' : 'New here? <a href="#/join">List your business</a> and your login is created on the way, or <a href="#/account?mode=new">create an account</a>.'}</p></div>`;
 }
 
-const statusText = b => (b.status === 'approved' ? 'Live' : b.status === 'pending' ? 'Waiting for approval' : 'Not approved') + ', ' + C.plans[b.plan].name + ' plan';
+const statusText = b => (b.status === 'approved' ? 'Live' : b.status === 'pending' ? 'Waiting for the admin' : 'Not approved') + ', ' + C.plans[b.plan].name + ' plan'
+  + (b.plan !== 'starter' && b.paid_until ? `, paid until ${fmtDate(b.paid_until)}` : '');
 
 async function dashboard(parts, params) {
   if (!ME.user) return `<div class="wrap page narrow"><h1>Business dashboard</h1><p class="lead">Sign in to manage your listing.</p><p><a class="btn btn-green" href="#/account">Sign in</a> <a class="btn btn-line" href="#/join">List your business</a></p></div>`;
@@ -546,16 +612,38 @@ async function dashboard(parts, params) {
   const inCat = approved().filter(x => x.cat === b.cat), pos = inCat.findIndex(x => x.id === b.id) + 1;
   const max = Math.max(1, ...st.wa), labels = ['3 weeks ago', '2 weeks ago', 'Last week', 'This week'];
   const share = 'https://wa.me/?text=' + encodeURIComponent(`Find ${b.name} on ${C.siteName}: ${siteUrl()}#/b/${b.id}`);
-  const wants = b.requested_plan !== b.plan && RANK[b.requested_plan] < RANK[b.plan];
   const photos = b.photos || [];
+  const pays = DB.payments.filter(x => x.business_id === b.id);
+  const waiting = pays.find(x => x.status === 'pending'), turnedDown = pays[0] && pays[0].status === 'rejected' ? pays[0] : null;
+  const left = paid ? daysLeft(b) : null, ending = left !== null && left <= REMIND_DAYS;
+  const payPlan = C.plans[params.get('pay')] && params.get('pay') !== 'starter' ? params.get('pay') : (paid ? b.plan : (b.lapsed_plan || b.requested_plan || 'growth'));
+  const pickPlan = payPlan === 'starter' ? 'growth' : payPlan;
+  const payOpen = !!params.get('pay') || ending || !!b.lapsed_plan || !!turnedDown;
+  const howToPay = C.paymentNote ? esc(C.paymentNote.replace(/\.$/, '')) : 'the admin by EcoCash';
+  const payForm = waiting ? '' : `<section id="pay"><details class="pay"${payOpen ? ' open' : ''}><summary>${paid ? 'Pay for your next month' : 'Upgrade your plan'}</summary>
+      <form data-form="pay" data-id="${esc(b.id)}" class="card-form">
+        ${field('Plan', `<select name="plan" data-change="pay-plan">${['growth', 'premium'].map(x => `<option value="${x}"${x === pickPlan ? ' selected' : ''}>${C.plans[x].name}, $${priceNow(x)} a month</option>`).join('')}</select>`)}
+        <p>Pay ${howToPay}. Then enter the details below and the admin will switch your plan on for ${PLAN_DAYS} days.</p>
+        <div class="two">
+          ${field('EcoCash transaction reference', '<input name="reference" required minlength="3" maxlength="60" autocomplete="off" placeholder="e.g. MP231118.1200.A12345">', 'It is in the SMS EcoCash sends you. Paid in cash? Type CASH.')}
+          ${field('Amount paid ($)', `<input name="amount" type="number" min="0" max="999" step="0.01" required value="${priceNow(pickPlan)}">`)}
+        </div>
+        <button class="btn btn-brass" type="submit">Send payment details</button>
+      </form></details></section>`;
+  const planNote = waiting
+    ? `<p class="notice">Payment details sent: $${esc(waiting.amount)} for ${C.plans[waiting.plan].name}, reference <span class="ref">${esc(waiting.reference)}</span>. The admin will confirm it, usually the same day, and your plan switches on straight away.</p>`
+    : ending ? `<p class="notice notice-warn">Your ${p.name} plan ${left <= 0 ? 'ends today' : `ends in ${plural(left, 'day', 'days')}`}, on ${fmtDate(b.paid_until)}. Pay $${priceNow(b.plan)} below to keep your place in search${b.plan === 'premium' ? ', your video and your feature slot' : ', your deals and your reviews'}.</p>`
+    : !paid && b.lapsed_plan ? `<p class="notice notice-warn">Your ${C.plans[b.lapsed_plan].name} plan ended${b.paid_until ? ` on ${fmtDate(b.paid_until)}` : ''}, so your listing is back on Starter. Pay below to switch it back on.</p>`
+    : turnedDown ? `<p class="notice notice-warn">The admin could not find payment reference <span class="ref">${esc(turnedDown.reference)}</span>. Check the reference in your EcoCash SMS and send it again${C.adminWhatsApp ? `, or <a href="${waLink(C.adminWhatsApp, `Hi, about my payment for ${b.name} on ${C.siteName}, reference ${turnedDown.reference}.`)}" target="_blank" rel="noopener">message the admin</a>` : ''}.</p>`
+    : '';
 
   return `<div class="wrap page">
     ${m.length > 1 ? `<p class="chips">${m.map(x => `<a href="#/dashboard?id=${esc(x.id)}" class="${x.id === b.id ? 'on' : ''}">${esc(x.name)}</a>`).join('')}</p>` : ''}
     <h1>${esc(b.name)}</h1>
     <p class="lead">${statusText(b)}. ${b.status === 'approved' ? `<a href="#/b/${esc(b.id)}">View listing</a>` : ''}</p>
-    ${b.status === 'pending' ? '<p class="notice">Your listing is with the admin for approval. You can add photos and prices while you wait.</p>' : ''}
+    ${b.status === 'pending' ? `<p class="notice">Your listing is waiting for the admin to check it${b.review_note ? `, because: ${esc(b.review_note.replace(/\.$/, '').replace(/^./, c => c.toLowerCase()))}` : ''}. You can add photos and prices while you wait.</p>` : ''}
     ${b.status === 'rejected' ? `<p class="notice">This listing was not approved. ${C.adminWhatsApp ? `<a href="${waLink(C.adminWhatsApp, 'Hi, about my listing ' + b.name)}" target="_blank" rel="noopener">Message the admin</a> to find out why.` : ''}</p>` : ''}
-    ${wants ? `<p class="notice">You asked for ${C.plans[b.requested_plan].name} at $${priceNow(b.requested_plan)} a month. ${C.paymentNote ? esc(C.paymentNote) : 'The admin will WhatsApp you the payment details.'} It switches on once payment is in.</p>` : ''}
+    ${planNote}
 
     <section class="dash-stats">
       <div class="stat"><span class="stat-n">${st.view[3]}</span><span class="stat-l">profile views this week</span></div>
@@ -566,9 +654,10 @@ async function dashboard(parts, params) {
       <div class="bars">${st.wa.map((n, i) => `<div class="bar"><span class="bar-n">${n}</span><span class="bar-fill" style="height:${Math.round(n / max * 100)}%"></span><span class="bar-l">${labels[i]}</span></div>`).join('')}</div></section>`
       : `<section class="upsell"><h2>${st.view[3]} ${st.view[3] === 1 ? 'neighbour' : 'neighbours'} looked at your listing this week.</h2>
           <p>How many tapped WhatsApp? On Starter you cannot see that, and paid listings sit above yours in every search. Growth shows you clicks week by week, lets you post deals, collect reviews and link your Instagram, Facebook and TikTok.</p>
-          <form data-form="plan" data-id="${esc(b.id)}"><input type="hidden" name="plan" value="growth"><button class="btn btn-brass" type="submit">Ask for Growth, $${priceNow('growth')} a month</button></form></section>`}
+          <p><a class="btn btn-brass" href="#/dashboard?id=${esc(b.id)}&pay=growth">Upgrade to Growth, $${priceNow('growth')} a month</a></p></section>`}
     ${b.plan === 'growth' && pos > 1 ? `<section class="upsell"><h2>You are number ${pos} in ${esc(catName(b.cat))}.</h2><p>Premium listings always show first, and get a homepage feature slot, a business video and the Verified resident badge.</p>
-      <form data-form="plan" data-id="${esc(b.id)}"><input type="hidden" name="plan" value="premium"><button class="btn btn-brass" type="submit">Ask for Premium, $${priceNow('premium')} a month</button></form></section>` : ''}
+      <p><a class="btn btn-brass" href="#/dashboard?id=${esc(b.id)}&pay=premium">Upgrade to Premium, $${priceNow('premium')} a month</a></p></section>` : ''}
+    ${payForm}
 
     <section><h2>Bring your own customers</h2>
       <p>Listings that are shared in the estate WhatsApp groups get seen first.</p>
@@ -607,6 +696,14 @@ function admin() {
   const payers = rest.filter(b => b.status === 'approved' && b.plan !== 'starter' && b.paid);
   const revenue = payers.reduce((a, b) => a + C.plans[b.plan].price, 0);
   const featN = DB.all.filter(b => b.featured).length;
+  const claims = DB.payments.filter(x => x.status === 'pending');
+  const soon = DB.all.filter(b => b.plan !== 'starter' && b.paid_until && daysLeft(b) <= REMIND_DAYS).sort((a, b) => a.paid_until < b.paid_until ? -1 : 1);
+  const ended = DB.all.filter(b => b.plan === 'starter' && b.lapsed_plan && b.status === 'approved');
+  const remind = (b, plan, endedNow) => b.wa ? `<a class="btn btn-wa btn-small" href="${waLink(b.wa, `Hi ${b.owner_name || b.name}, your ${C.plans[plan].name} plan for ${b.name} on ${C.siteName} ${endedNow ? 'ended' : 'ends'}${b.paid_until ? ` on ${fmtDate(b.paid_until)}` : ''}. To ${endedNow ? 'switch it back on' : 'keep it'}, pay $${priceNow(plan)}${C.paymentNote ? ` (${C.paymentNote.replace(/\.$/, '')})` : ' by EcoCash'} and enter the payment reference in your dashboard: ${siteUrl()}#/dashboard?id=${b.id}&pay=${plan}`)}" target="_blank" rel="noopener">Send reminder</a>` : '<span class="muted">No WhatsApp number</span>';
+  const reasons = b => DB.reports.filter(r => r.business_id === b.id).map(r => esc(r.reason));
+  const paidCell = b => b.plan === 'starter' ? '<span class="muted">Free</span>'
+    : !b.paid ? '<span class="muted">Not paid</span>'
+    : b.paid_until ? `${fmtDate(b.paid_until)}<br><span class="muted">${daysLeft(b) <= 0 ? 'ends today' : plural(daysLeft(b), 'day', 'days') + ' left'}</span>` : '<span class="muted">No end date</span>';
   const tog = (b, f, on, off) => `<button type="button" class="tog ${b[f] ? 'on' : ''}" data-act="adm-toggle" data-id="${esc(b.id)}" data-f="${f}">${b[f] ? on : off}</button>`;
   return `<div class="wrap page">
     <h1>Admin</h1>
@@ -617,9 +714,26 @@ function admin() {
       <div class="stat"><span class="stat-n">${featN}<small> of ${C.featuredSlots}</small></span><span class="stat-l">feature slots used</span></div>
     </section>
 
+    <section><h2>Payments to check</h2>
+      ${claims.length ? claims.map(x => { const b = byId(x.business_id) || { name: 'Deleted business', wa: '' }; return `<div class="adm-pending">
+        <p><strong>${esc(b.name)}</strong><span class="sep"></span>${C.plans[x.plan].name}<span class="sep"></span>$${esc(x.amount)}<span class="sep"></span>${ago(x.created_at)}</p>
+        <p>Reference <span class="ref">${esc(x.reference)}</span>${b.wa ? `<span class="sep"></span><a href="${waLink(b.wa)}" target="_blank" rel="noopener">WhatsApp the owner</a>` : ''}</p>
+        <p class="muted">Check that this reference and amount are in your EcoCash messages. Confirming switches ${C.plans[x.plan].name} on for ${PLAN_DAYS} days.</p>
+        <p><button class="btn btn-green btn-small" type="button" data-act="adm-pay" data-id="${esc(x.id)}" data-ok="1">Confirm payment</button>
+        <button class="btn btn-line btn-small" type="button" data-act="adm-pay" data-id="${esc(x.id)}" data-ok="0">Not found</button></p></div>`; }).join('')
+        : '<p class="muted">No payments waiting.</p>'}</section>
+
+    ${soon.length || ended.length ? `<section><h2>Ending soon</h2>
+      <p class="muted">Plans end by themselves when the time is up, and owners see a warning in their dashboard. A WhatsApp reminder from you helps them renew.</p>
+      <ul class="adm-list adm-soon">${soon.map(b => `<li><span><strong>${esc(b.name)}</strong>, ${C.plans[b.plan].name}: ${daysLeft(b) <= 0 ? 'ends today' : `ends in ${plural(daysLeft(b), 'day', 'days')}`}</span> ${remind(b, b.plan, false)}</li>`).join('')}
+      ${ended.map(b => `<li><span><strong>${esc(b.name)}</strong>: ${C.plans[b.lapsed_plan].name} ended${b.paid_until ? ` on ${fmtDate(b.paid_until)}` : ''}, now on Starter</span> ${remind(b, b.lapsed_plan, true)}</li>`).join('')}</ul></section>` : ''}
+
     <section><h2>Waiting for approval</h2>
+      <p class="muted">Listings that pass the automatic checks go live by themselves. These ones need you.</p>
       ${pending.length ? pending.map(b => `<div class="adm-pending">
-        <p><strong>${esc(b.name)}</strong><span class="sep"></span>${esc(catName(b.cat))}<span class="sep"></span>asked for ${C.plans[b.requested_plan || 'starter'].name}</p>
+        <p><strong>${esc(b.name)}</strong><span class="sep"></span>${esc(catName(b.cat))}</p>
+        ${b.review_note ? `<p class="why">Why it needs you: ${esc(b.review_note)}</p>` : ''}
+        ${reasons(b).length ? `<p class="muted">Reports: ${reasons(b).join('; ')}</p>` : ''}
         <p>${esc(b.tagline)}</p><p class="muted">${esc(b.owner_name)}${b.wa ? `<span class="sep"></span><a href="${waLink(b.wa)}" target="_blank" rel="noopener">WhatsApp ${esc(b.wa)}</a>` : ''}<span class="sep"></span><a href="#/b/${esc(b.id)}">Preview</a></p>
         <p><button class="btn btn-green btn-small" type="button" data-act="adm-status" data-id="${esc(b.id)}" data-v="approved">Approve</button>
         <button class="btn btn-line btn-small" type="button" data-act="adm-status" data-id="${esc(b.id)}" data-v="rejected">Reject</button></p></div>`).join('')
@@ -627,11 +741,11 @@ function admin() {
 
     <section><h2>All businesses</h2>
       <div class="table-scroll"><table class="adm">
-        <thead><tr><th>Business</th><th>Plan</th><th>Paid</th><th>Verified</th><th>Featured</th><th></th></tr></thead>
+        <thead><tr><th>Business</th><th>Plan</th><th>Paid until</th><th>Verified</th><th>Featured</th><th></th></tr></thead>
         <tbody>${rest.map(b => `<tr>
-          <td><a href="#/b/${esc(b.id)}">${esc(b.name)}</a>${b.status === 'rejected' ? ' <span class="muted">(rejected)</span>' : ''}${b.requested_plan && b.requested_plan !== b.plan ? `<br><span class="muted">asked for ${C.plans[b.requested_plan].name}</span>` : ''}</td>
+          <td><a href="#/b/${esc(b.id)}">${esc(b.name)}</a>${b.status === 'rejected' ? ' <span class="muted">(rejected)</span>' : ''}${reasons(b).length ? `<br><span class="muted">${plural(reasons(b).length, 'report', 'reports')}</span>` : ''}</td>
           <td><select data-change="adm-plan" data-id="${esc(b.id)}" aria-label="Plan for ${esc(b.name)}">${['starter', 'growth', 'premium'].map(x => `<option value="${x}"${x === b.plan ? ' selected' : ''}>${C.plans[x].name}</option>`).join('')}</select></td>
-          <td>${b.plan === 'starter' ? '<span class="muted">Free</span>' : tog(b, 'paid', 'Paid', 'Not paid')}</td>
+          <td>${paidCell(b)}${b.plan !== 'starter' ? `<br><button type="button" class="link" data-act="adm-extend" data-id="${esc(b.id)}">+1 month</button>` : ''}</td>
           <td>${tog(b, 'verified', 'Verified', 'No')}</td>
           <td>${b.plan === 'premium' ? tog(b, 'featured', 'Featured', 'No') : '<span class="muted">Premium only</span>'}</td>
           <td class="adm-acts"><a href="#/dashboard?id=${esc(b.id)}">Edit</a> ${b.status === 'rejected' ? `<button type="button" class="link" data-act="adm-status" data-id="${esc(b.id)}" data-v="approved">Approve</button>` : ''} <button type="button" class="link danger" data-act="adm-delete" data-id="${esc(b.id)}">Delete</button></td>
@@ -729,6 +843,7 @@ async function render(keepScroll) {
   fillInstall();
   document.title = ($('#app h1') ? $('#app h1').textContent + ' | ' : '') + C.siteName;
   if (!keepScroll) window.scrollTo(0, 0);
+  if (params.get('pay') && $('#pay') && $('#pay').scrollIntoView) $('#pay').scrollIntoView({ block: 'start' });
 }
 const refresh = async () => { await api.load(); await render(true); };
 const go = hash => { if (location.hash === hash) render(); else location.hash = hash; };
@@ -749,8 +864,8 @@ const forms = {
       const hasSession = await api.signUp(val(fd, 'email'), val(fd, 'password'));
       if (!hasSession) { ls.set('mm_draft', d); J.step = 5; return render(); }
     }
-    await api.createBiz(d);
-    J.step = 4; await api.load(); go('#/join');
+    const row = await api.createBiz(d);
+    J.step = 4; J.id = row.id; J.status = row.status; await api.load(); go('#/join');
   },
   async signin(fd) { await api.signIn(val(fd, 'email'), val(fd, 'password')); await afterSignIn(); },
   async forgot(fd) {
@@ -795,6 +910,18 @@ const forms = {
     if (fd.has('video')) { p.video = val(fd, 'video'); if (p.video && !ytId(p.video)) return toast('Paste the YouTube link to the video, for example https://youtu.be/...'); }
     await api.updateBiz(f.dataset.id, p); toast('Changes saved.'); await refresh();
   },
+  async pay(fd, f) {
+    const plan = val(fd, 'plan'), reference = val(fd, 'reference').toUpperCase(), amount = Number(val(fd, 'amount'));
+    if (!C.plans[plan] || plan === 'starter') return toast('Choose Growth or Premium.');
+    await api.claimPayment({ business_id: f.dataset.id, plan, amount, reference });
+    toast('Payment details sent. Your plan switches on as soon as the admin confirms it.'); await refresh();
+  },
+  async report(fd, f) {
+    const detail = val(fd, 'detail'), reason = val(fd, 'reason') + (detail ? ': ' + detail : '');
+    await api.report(f.dataset.id, reason);
+    const done = ls.get('mm_reported') || {}; done[f.dataset.id] = 1; ls.set('mm_reported', done);
+    toast('Thank you. The admin will look into it.'); await refresh();
+  },
   async plan(fd, f) {
     const plan = val(fd, 'plan');
     await api.updateBiz(f.dataset.id, { requested_plan: plan });
@@ -804,7 +931,7 @@ const forms = {
 };
 async function afterSignIn() {
   const draft = ls.get('mm_draft');
-  if (draft && ME.user) { await api.createBiz(draft); ls.del('mm_draft'); toast('Your listing was sent for approval.'); }
+  if (draft && ME.user) { const row = await api.createBiz(draft); ls.del('mm_draft'); toast(row.status === 'approved' ? 'Your listing is live.' : 'Your listing was sent for approval.'); }
   await api.load(); go(mine().length ? '#/dashboard' : '#/account');
 }
 
@@ -826,7 +953,16 @@ const acts = {
     const b = byId(t.dataset.id), photos = (b.photos || []).slice(); photos.splice(Number(t.dataset.i), 1);
     await api.updateBiz(b.id, { photos }); await refresh();
   },
-  async 'adm-status'(t) { await api.updateBiz(t.dataset.id, { status: t.dataset.v }); toast(t.dataset.v === 'approved' ? 'Approved. The listing is live.' : 'Rejected.'); await refresh(); },
+  async 'adm-status'(t) { await api.updateBiz(t.dataset.id, t.dataset.v === 'approved' ? { status: 'approved', review_note: '' } : { status: t.dataset.v }); toast(t.dataset.v === 'approved' ? 'Approved. The listing is live.' : 'Rejected.'); await refresh(); },
+  async 'adm-pay'(t) {
+    const good = t.dataset.ok === '1';
+    await api.confirmPayment(t.dataset.id, good);
+    toast(good ? `Confirmed. The plan is on for ${PLAN_DAYS} days.` : 'Marked as not found. The owner will see it in their dashboard.'); await refresh();
+  },
+  async 'adm-extend'(t) {
+    const b = byId(t.dataset.id);
+    await api.extend(b.id, b.plan); toast(`${b.name}: ${C.plans[b.plan].name} extended by ${PLAN_DAYS} days.`); await refresh();
+  },
   async 'adm-toggle'(t) {
     const b = byId(t.dataset.id), f = t.dataset.f;
     if (f === 'featured' && !b.featured && DB.all.filter(x => x.featured).length >= C.featuredSlots) return toast(`All ${C.featuredSlots} feature slots are taken. Free one up first.`);
@@ -847,8 +983,9 @@ const acts = {
   'preview-reset'() { ls.del(PKEY); S = seed(); persist(); api.session().then(refresh); toast('Preview reset to the sample data.'); }
 };
 const changes = {
+  'pay-plan'(t) { const a = t.form.querySelector('[name=amount]'); if (a) a.value = priceNow(t.value); },
   async 'adm-plan'(t) {
-    const p = { plan: t.value }; if (t.value !== 'premium') p.featured = false; if (t.value === 'starter') p.paid = false;
+    const p = { plan: t.value }; if (t.value !== 'premium') p.featured = false; if (t.value === 'starter') Object.assign(p, { paid: false, paid_until: null, lapsed_plan: '' });
     await api.updateBiz(t.dataset.id, p); toast('Plan changed.'); await refresh();
   },
   async photo(t) {

@@ -41,6 +41,10 @@ create table public.businesses (
   wa text not null default '',
   photos jsonb not null default '[]',
   deal text not null default '' check (char_length(deal) <= 200),
+  video text not null default '',
+  instagram text not null default '',
+  facebook text not null default '',
+  tiktok text not null default '',
   plan text not null default 'starter' check (plan in ('starter','growth','premium')),
   requested_plan text not null default 'starter' check (requested_plan in ('starter','growth','premium')),
   status text not null default 'pending' check (status in ('pending','approved','rejected')),
@@ -200,6 +204,19 @@ create policy "photos are public" on storage.objects for select using (bucket_id
 create policy "signed-in people upload photos" on storage.objects for insert to authenticated
   with check (bucket_id = 'photos');
 
+-- ---------- admin: set a forgotten password ---------------------------
+create function public.admin_set_password(p_email text, p_password text)
+returns void language plpgsql security definer set search_path = public, extensions as $$
+begin
+  if not public.is_admin() then raise exception 'Only the admin can do this.'; end if;
+  if char_length(coalesce(p_password, '')) < 6 then raise exception 'Use at least 6 characters.'; end if;
+  update auth.users set encrypted_password = extensions.crypt(p_password, extensions.gen_salt('bf')), updated_at = now()
+    where lower(email) = lower(trim(p_email));
+  if not found then raise exception 'No account with that email.'; end if;
+end $$;
+revoke execute on function public.admin_set_password(text, text) from public, anon;
+grant execute on function public.admin_set_password(text, text) to authenticated;
+
 -- ---------- access for the website -----------------------------------
 grant usage on schema public to anon, authenticated;
 grant select, insert, update, delete on all tables in schema public to anon, authenticated;
@@ -212,3 +229,175 @@ grant execute on all functions in schema public to anon, authenticated;
 --
 --   update public.profiles set is_admin = true where email = 'you@example.com';
 -- =====================================================================
+
+
+-- =====================================================================
+-- Vazuva: automatic approvals, payments, expiry and reports.
+-- Paste this whole file into Supabase > SQL Editor > New query > Run.
+-- Safe to run again if you are not sure it worked.
+-- =====================================================================
+
+-- ---------- new details on each business ------------------------------
+alter table public.businesses
+  add column if not exists paid_until timestamptz,
+  add column if not exists lapsed_plan text not null default '',
+  add column if not exists review_note text not null default '';
+
+-- ---------- automatic checks on new listings --------------------------
+-- Returns '' when a listing looks fine, otherwise the reason it needs
+-- the admin to look at it.
+create or replace function public.review_problem(p_id uuid, p_owner uuid, p_name text, p_wa text, p_tagline text)
+returns text language plpgsql stable security definer set search_path = public as $$
+begin
+  if char_length(trim(coalesce(p_tagline, ''))) < 5 then
+    return 'The one-line summary is missing or very short.';
+  end if;
+  if coalesce(p_wa, '') !~ '^2637[0-9]{8}$' then
+    return 'The WhatsApp number is not a Zimbabwean mobile number.';
+  end if;
+  if exists (select 1 from businesses b where b.id <> p_id and b.status <> 'rejected'
+             and lower(trim(b.name)) = lower(trim(p_name))) then
+    return 'Another listing already uses this name.';
+  end if;
+  if exists (select 1 from businesses b where b.id <> p_id and b.status <> 'rejected'
+             and b.wa = p_wa and b.owner <> p_owner) then
+    return 'Another owner already uses this WhatsApp number.';
+  end if;
+  if exists (select 1 from businesses b where b.owner = p_owner and b.status = 'rejected') then
+    return 'This owner has had a listing rejected before.';
+  end if;
+  return '';
+end $$;
+
+-- Owners cannot approve themselves, give themselves a paid plan or change
+-- payment dates. New listings that pass the checks go live straight away.
+create or replace function public.guard_business() returns trigger
+language plpgsql set search_path = public as $$
+declare problem text;
+begin
+  if current_user not in ('anon', 'authenticated') then return new; end if;  -- the system itself
+  if tg_op = 'INSERT' then
+    if not public.is_admin() then
+      new.owner := auth.uid();
+      new.plan := 'starter'; new.paid := false; new.verified := false; new.featured := false;
+      new.paid_until := null; new.lapsed_plan := '';
+    end if;
+    problem := public.review_problem(new.id, new.owner, new.name, new.wa, new.tagline);
+    new.status := case when problem = '' then 'approved' else 'pending' end;
+    new.review_note := problem;
+  elsif not public.is_admin() then
+    new.owner := old.owner; new.plan := old.plan; new.status := old.status;
+    new.paid := old.paid; new.verified := old.verified; new.featured := old.featured;
+    new.paid_until := old.paid_until; new.lapsed_plan := old.lapsed_plan; new.review_note := old.review_note;
+  end if;
+  if new.plan = 'starter' then new.deal := ''; end if;
+  return new;
+end $$;
+
+-- ---------- payments ---------------------------------------------------
+create table if not exists public.payments (
+  id uuid primary key default gen_random_uuid(),
+  business_id uuid not null references public.businesses on delete cascade,
+  owner uuid not null default auth.uid() references auth.users on delete cascade,
+  plan text not null check (plan in ('growth', 'premium')),
+  amount numeric not null default 0 check (amount >= 0 and amount < 1000),
+  reference text not null check (char_length(reference) between 3 and 60),
+  status text not null default 'pending' check (status in ('pending', 'confirmed', 'rejected')),
+  created_at timestamptz not null default now()
+);
+create unique index if not exists payments_one_pending on public.payments (business_id) where status = 'pending';
+alter table public.payments enable row level security;
+drop policy if exists "owner or admin reads payments" on public.payments;
+create policy "owner or admin reads payments" on public.payments for select
+  using (owner = auth.uid() or public.is_admin());
+drop policy if exists "owner sends payment details" on public.payments;
+create policy "owner sends payment details" on public.payments for insert to authenticated
+  with check (owner = auth.uid() and status = 'pending'
+    and exists (select 1 from public.businesses b where b.id = business_id and b.owner = auth.uid()));
+grant select, insert on public.payments to authenticated;
+
+-- Admin confirms (or turns down) a payment. Confirming switches the plan on
+-- for 30 days, added on to any time already paid for.
+create or replace function public.admin_confirm_payment(p_id uuid, p_ok boolean)
+returns void language plpgsql security definer set search_path = public as $$
+declare pay public.payments;
+begin
+  if not public.is_admin() then raise exception 'Only the admin can do this.'; end if;
+  select * into pay from payments where id = p_id and status = 'pending';
+  if not found then raise exception 'That payment was already handled.'; end if;
+  update payments set status = case when p_ok then 'confirmed' else 'rejected' end where id = p_id;
+  if p_ok then
+    update businesses set plan = pay.plan, paid = true, lapsed_plan = '',
+      paid_until = greatest(coalesce(paid_until, now()), now()) + interval '30 days'
+      where id = pay.business_id;
+  end if;
+end $$;
+
+-- Admin adds a month by hand, for cash payments.
+create or replace function public.admin_extend(p_id uuid, p_plan text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_admin() then raise exception 'Only the admin can do this.'; end if;
+  if p_plan not in ('growth', 'premium') then raise exception 'Choose Growth or Premium first.'; end if;
+  update businesses set plan = p_plan, paid = true, lapsed_plan = '',
+    paid_until = greatest(coalesce(paid_until, now()), now()) + interval '30 days'
+    where id = p_id;
+end $$;
+
+-- ---------- reports ----------------------------------------------------
+create table if not exists public.reports (
+  id uuid primary key default gen_random_uuid(),
+  business_id uuid not null references public.businesses on delete cascade,
+  reason text not null check (char_length(reason) between 2 and 200),
+  reporter text not null check (char_length(reporter) between 8 and 64),
+  created_at timestamptz not null default now(),
+  unique (business_id, reporter)
+);
+alter table public.reports enable row level security;
+drop policy if exists "admin reads reports" on public.reports;
+create policy "admin reads reports" on public.reports for select to authenticated using (public.is_admin());
+drop policy if exists "admin clears reports" on public.reports;
+create policy "admin clears reports" on public.reports for delete to authenticated using (public.is_admin());
+grant select, delete on public.reports to authenticated;
+
+-- Anyone can report a listing. Three different people hide it until the admin looks.
+create or replace function public.report_listing(p_id uuid, p_reason text, p_reporter text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  insert into reports (business_id, reason, reporter) values (p_id, left(p_reason, 200), p_reporter)
+    on conflict do nothing;
+  if (select count(*) from reports where business_id = p_id) >= 3 then
+    update businesses set status = 'pending', review_note = 'Hidden after reports from 3 people.'
+      where id = p_id and status = 'approved';
+  end if;
+end $$;
+
+-- When the admin approves a listing, its old reports are cleared.
+create or replace function public.clear_reports() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  if new.status = 'approved' and old.status <> 'approved' then
+    delete from reports where business_id = new.id;
+  end if;
+  return null;
+end $$;
+drop trigger if exists clear_reports on public.businesses;
+create trigger clear_reports after update of status on public.businesses
+  for each row execute function public.clear_reports();
+
+-- ---------- housekeeping, run each time someone opens the site ---------
+-- Ends plans whose 30 days are up and clears requests older than 14 days.
+create or replace function public.housekeeping()
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  update businesses set lapsed_plan = plan, plan = 'starter', paid = false, featured = false, deal = ''
+    where plan <> 'starter' and paid_until is not null and paid_until < now();
+  delete from requests where created_at < now() - interval '14 days';
+end $$;
+
+-- ---------- access for the website -----------------------------------
+grant execute on function public.review_problem(uuid, uuid, text, text, text) to authenticated;
+grant execute on function public.admin_confirm_payment(uuid, boolean) to authenticated;
+grant execute on function public.admin_extend(uuid, text) to authenticated;
+grant execute on function public.report_listing(uuid, text, text) to anon, authenticated;
+grant execute on function public.housekeeping() to anon, authenticated;
