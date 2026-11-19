@@ -464,3 +464,306 @@ drop policy if exists "admin removes ideas" on public.ideas;
 create policy "admin removes ideas" on public.ideas for delete to authenticated using (public.is_admin());
 grant insert on public.ideas to anon, authenticated;
 grant select, update, delete on public.ideas to authenticated;
+
+
+-- =====================================================================
+-- Vazuva: notifications (the bell on the site, and phone pop-ups).
+-- Deploy the send-push function FIRST (see the steps), then paste this
+-- whole file into Supabase > SQL Editor > New query > Run.
+-- Safe to run again if you are not sure it worked.
+-- =====================================================================
+
+create extension if not exists pg_net;
+
+-- ---------- where notifications live ---------------------------------
+create table if not exists public.notifications (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users on delete cascade,     -- a signed-in person
+  device_key text,                                           -- or a resident's phone, no account needed
+  kind text not null,
+  title text not null,
+  body text not null default '',
+  link text not null default '',
+  read boolean not null default false,
+  created_at timestamptz not null default now(),
+  check (user_id is not null or device_key is not null)
+);
+create index if not exists notifications_user on public.notifications (user_id, created_at desc);
+create index if not exists notifications_device on public.notifications (device_key, created_at desc);
+alter table public.notifications enable row level security;
+drop policy if exists "read own notifications" on public.notifications;
+create policy "read own notifications" on public.notifications for select to authenticated using (user_id = auth.uid());
+drop policy if exists "mark own notifications read" on public.notifications;
+create policy "mark own notifications read" on public.notifications for update to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+drop policy if exists "clear own notifications" on public.notifications;
+create policy "clear own notifications" on public.notifications for delete to authenticated using (user_id = auth.uid());
+grant select, update, delete on public.notifications to authenticated;
+
+-- Phones that turned on pop-ups. Only the system reads this.
+create table if not exists public.push_subscriptions (
+  endpoint text primary key,
+  user_id uuid references auth.users on delete cascade,
+  device_key text,
+  p256dh text not null,
+  auth text not null,
+  created_at timestamptz not null default now()
+);
+alter table public.push_subscriptions enable row level security;
+
+-- Settings for the pop-up sender. Only the system reads this.
+create table if not exists public.push_config (
+  id int primary key default 1 check (id = 1),
+  secret text not null default replace(gen_random_uuid()::text, '-', '') || replace(gen_random_uuid()::text, '-', ''),
+  fn_url text not null default '',
+  vapid_public text,
+  vapid_private text
+);
+alter table public.push_config enable row level security;
+insert into public.push_config (id, fn_url)
+  values (1, 'https://tduzkhfobaekauogqurw.supabase.co/functions/v1/send-push')
+  on conflict (id) do update set fn_url = excluded.fn_url;
+
+-- ---------- sending ----------------------------------------------------
+create or replace function public.notify(p_user uuid, p_key text, p_kind text, p_title text, p_body text, p_link text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if p_user is null and coalesce(p_key, '') = '' then return; end if;
+  insert into notifications (user_id, device_key, kind, title, body, link)
+    values (p_user, nullif(p_key, ''), p_kind, left(p_title, 120), left(coalesce(p_body, ''), 300), coalesce(p_link, ''));
+end $$;
+
+create or replace function public.notify_admins(p_kind text, p_title text, p_body text, p_link text)
+returns void language plpgsql security definer set search_path = public as $$
+declare a record;
+begin
+  for a in select id from profiles where is_admin loop
+    perform public.notify(a.id, null, p_kind, p_title, p_body, p_link);
+  end loop;
+end $$;
+
+-- Every new notification is handed to the pop-up sender. If that fails,
+-- the notification still shows on the bell.
+create or replace function public.push_notification() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare cfg public.push_config;
+begin
+  select * into cfg from push_config where id = 1;
+  if cfg.fn_url = '' or cfg.vapid_public is null then return null; end if;
+  if not exists (select 1 from push_subscriptions s
+                 where (new.user_id is not null and s.user_id = new.user_id)
+                    or (new.device_key is not null and s.device_key = new.device_key)) then return null; end if;
+  begin
+    perform net.http_post(url := cfg.fn_url, body := jsonb_build_object('id', new.id),
+      headers := jsonb_build_object('Content-Type', 'application/json', 'x-push-secret', cfg.secret));
+  exception when others then null;
+  end;
+  return null;
+end $$;
+drop trigger if exists push_notification on public.notifications;
+create trigger push_notification after insert on public.notifications
+  for each row execute function public.push_notification();
+
+-- ---------- what the site calls ---------------------------------------
+create or replace function public.get_push_key() returns text
+language sql stable security definer set search_path = public as $$
+  select vapid_public from push_config where id = 1
+$$;
+
+create or replace function public.save_push_subscription(p_endpoint text, p_p256dh text, p_auth text, p_key text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if coalesce(p_endpoint, '') !~ '^https://' or char_length(p_endpoint) > 1000 then raise exception 'Not a valid subscription.'; end if;
+  insert into push_subscriptions (endpoint, user_id, device_key, p256dh, auth)
+    values (p_endpoint, auth.uid(), nullif(p_key, ''), p_p256dh, p_auth)
+  on conflict (endpoint) do update set user_id = coalesce(auth.uid(), push_subscriptions.user_id),
+    device_key = coalesce(nullif(p_key, ''), push_subscriptions.device_key), p256dh = excluded.p256dh, auth = excluded.auth;
+end $$;
+
+create or replace function public.remove_push_subscription(p_endpoint text)
+returns void language sql security definer set search_path = public as $$
+  delete from push_subscriptions where endpoint = p_endpoint
+$$;
+
+-- A resident's phone reads its own notifications with its private key.
+create or replace function public.device_notifications(p_key text)
+returns setof public.notifications language sql stable security definer set search_path = public as $$
+  select * from notifications where char_length(coalesce(p_key, '')) >= 16 and device_key = p_key
+  order by created_at desc limit 50
+$$;
+create or replace function public.mark_device_read(p_key text)
+returns void language sql security definer set search_path = public as $$
+  update notifications set read = true where char_length(coalesce(p_key, '')) >= 16 and device_key = p_key and not read
+$$;
+
+-- ---------- requests remember the phone that posted them --------------
+alter table public.request_contacts add column if not exists poster_key text;
+alter table public.request_contacts alter column wa set default '';
+create table if not exists public.request_offers (
+  request_id uuid not null references public.requests on delete cascade,
+  owner uuid not null references auth.users on delete cascade,
+  primary key (request_id, owner)
+);
+alter table public.request_offers enable row level security;
+
+drop function if exists public.post_request(text, text, text, text, text);
+create or replace function public.post_request(p_need text, p_when text, p_name text, p_cat text, p_wa text, p_key text default null)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare new_id uuid;
+begin
+  insert into public.requests (need, when_text, name, cat)
+    values (p_need, coalesce(p_when, ''), p_name, coalesce(p_cat, 'other'))
+    returning id into new_id;
+  if coalesce(p_wa, '') <> '' or coalesce(p_key, '') <> '' then
+    insert into public.request_contacts (request_id, wa, poster_key) values (new_id, coalesce(p_wa, ''), nullif(p_key, ''));
+  end if;
+  return new_id;
+end $$;
+grant execute on function public.post_request(text, text, text, text, text, text) to anon, authenticated;
+
+-- A business taps "I can help": counted once, and the resident is told.
+create or replace function public.request_contact(p_id uuid)
+returns text language plpgsql security definer set search_path = public as $$
+declare biz text; c public.request_contacts;
+begin
+  if not (public.is_admin() or exists (
+      select 1 from public.businesses b where b.owner = auth.uid() and b.status = 'approved')) then
+    return null;
+  end if;
+  select * into c from request_contacts where request_id = p_id;
+  insert into request_offers (request_id, owner) values (p_id, auth.uid()) on conflict do nothing;
+  if found then
+    update public.requests r set replies = r.replies + 1 where r.id = p_id;
+    select b.name into biz from businesses b where b.owner = auth.uid() and b.status = 'approved' order by b.created_at limit 1;
+    if c.poster_key is not null then
+      perform public.notify(null, c.poster_key, 'offer', coalesce(biz, 'A business') || ' can help',
+        'They saw your request and will message you on WhatsApp.', '#/requests');
+    end if;
+  end if;
+  return coalesce(c.wa, '');
+end $$;
+
+-- ---------- what creates notifications ---------------------------------
+create or replace function public.on_new_profile() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  perform public.notify_admins('signup', 'New sign-up', coalesce(new.email, 'A new account'), '#/admin');
+  return null;
+end $$;
+drop trigger if exists notify_new_profile on public.profiles;
+create trigger notify_new_profile after insert on public.profiles for each row execute function public.on_new_profile();
+
+create or replace function public.on_business_change() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  if tg_op = 'INSERT' then
+    if new.status = 'approved' then
+      perform public.notify_admins('listing', 'New listing is live', new.name, '#/b/' || new.id);
+    else
+      perform public.notify_admins('listing', 'Listing waiting for you', new.name || ': ' || new.review_note, '#/admin');
+    end if;
+  elsif new.status is distinct from old.status then
+    if new.status = 'approved' and old.status <> 'approved' then
+      perform public.notify(new.owner, null, 'approved', new.name || ' is live', 'Neighbours can now find it in the directory.', '#/b/' || new.id);
+    elsif new.status = 'rejected' then
+      perform public.notify(new.owner, null, 'rejected', new.name || ' was not approved', 'Message the admin to find out why.', '#/dashboard?id=' || new.id);
+    elsif new.status = 'pending' and old.status = 'approved' then
+      perform public.notify_admins('report', 'Listing hidden', new.name || ': ' || new.review_note, '#/admin');
+    end if;
+  end if;
+  return null;
+end $$;
+drop trigger if exists notify_business_change on public.businesses;
+create trigger notify_business_change after insert or update of status on public.businesses
+  for each row execute function public.on_business_change();
+
+create or replace function public.on_payment_change() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare bname text;
+begin
+  select name into bname from businesses where id = new.business_id;
+  if tg_op = 'INSERT' then
+    perform public.notify_admins('payment', 'Payment to check',
+      '$' || new.amount || ' for ' || initcap(new.plan) || ' from ' || coalesce(bname, 'a business') || ', reference ' || new.reference, '#/admin');
+  elsif new.status = 'confirmed' and old.status = 'pending' then
+    perform public.notify(new.owner, null, 'paid', initcap(new.plan) || ' plan is on', coalesce(bname, 'Your listing') || ' is on ' || initcap(new.plan) || ' for 30 days. Thank you!', '#/dashboard?id=' || new.business_id);
+  elsif new.status = 'rejected' and old.status = 'pending' then
+    perform public.notify(new.owner, null, 'unpaid', 'Payment not found', 'The admin could not find reference ' || new.reference || '. Check it and send it again.', '#/dashboard?id=' || new.business_id);
+  end if;
+  return null;
+end $$;
+drop trigger if exists notify_payment_change on public.payments;
+create trigger notify_payment_change after insert or update of status on public.payments
+  for each row execute function public.on_payment_change();
+
+create or replace function public.on_new_report() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare bname text;
+begin
+  select name into bname from businesses where id = new.business_id;
+  perform public.notify_admins('report', 'Listing reported', coalesce(bname, 'A listing') || ': ' || new.reason, '#/admin');
+  return null;
+end $$;
+drop trigger if exists notify_new_report on public.reports;
+create trigger notify_new_report after insert on public.reports for each row execute function public.on_new_report();
+
+create or replace function public.on_new_suggestion() returns trigger
+language plpgsql security definer set search_path = public as $$
+begin
+  perform public.notify_admins('suggestion', 'New suggestion', coalesce(nullif(new.topic, '') || ': ', '') || new.body, '#/admin');
+  return null;
+end $$;
+drop trigger if exists notify_new_suggestion on public.ideas;
+create trigger notify_new_suggestion after insert on public.ideas for each row execute function public.on_new_suggestion();
+
+-- A new request tells every owner with a live listing in that category.
+create or replace function public.on_new_request() returns trigger
+language plpgsql security definer set search_path = public as $$
+declare o record;
+begin
+  for o in select distinct b.owner from businesses b where b.status = 'approved' and b.cat = new.cat loop
+    perform public.notify(o.owner, null, 'request', 'New request near you', new.need, '#/requests');
+  end loop;
+  return null;
+end $$;
+drop trigger if exists notify_new_request on public.requests;
+create trigger notify_new_request after insert on public.requests for each row execute function public.on_new_request();
+
+-- ---------- plan reminders, from the housekeeping that runs on each visit
+alter table public.businesses add column if not exists reminded_until timestamptz;
+create or replace function public.housekeeping()
+returns void language plpgsql security definer set search_path = public as $$
+declare b record;
+begin
+  for b in select * from businesses where plan <> 'starter' and paid_until is not null
+           and paid_until > now() and paid_until < now() + interval '5 days'
+           and reminded_until is distinct from paid_until loop
+    perform public.notify(b.owner, null, 'ending', 'Your ' || initcap(b.plan) || ' plan ends soon',
+      b.name || ': ends on ' || to_char(b.paid_until, 'DD Mon') || '. Pay from your dashboard to keep it.', '#/dashboard?id=' || b.id || '&pay=' || b.plan);
+    update businesses set reminded_until = b.paid_until where id = b.id;
+  end loop;
+  for b in select * from businesses where plan <> 'starter' and paid_until is not null and paid_until < now() loop
+    perform public.notify(b.owner, null, 'ended', 'Your ' || initcap(b.plan) || ' plan has ended',
+      b.name || ' is back on Starter. Pay from your dashboard to switch it back on.', '#/dashboard?id=' || b.id || '&pay=' || b.plan);
+  end loop;
+  update businesses set lapsed_plan = plan, plan = 'starter', paid = false, featured = false, deal = ''
+    where plan <> 'starter' and paid_until is not null and paid_until < now();
+  delete from requests where created_at < now() - interval '14 days';
+  delete from notifications where created_at < now() - interval '60 days';
+end $$;
+
+-- ---------- access for the website -----------------------------------
+revoke execute on function public.notify(uuid, text, text, text, text, text) from public, anon, authenticated;
+revoke execute on function public.notify_admins(text, text, text, text) from public, anon, authenticated;
+grant execute on function public.get_push_key() to anon, authenticated;
+grant execute on function public.save_push_subscription(text, text, text, text) to anon, authenticated;
+grant execute on function public.remove_push_subscription(text) to anon, authenticated;
+grant execute on function public.device_notifications(text) to anon, authenticated;
+grant execute on function public.mark_device_read(text) to anon, authenticated;
+grant execute on function public.request_contact(uuid) to authenticated;
+grant execute on function public.housekeeping() to anon, authenticated;
+
+-- ---------- last step: ask the sender to create its keys ---------------
+select net.http_post(
+  url := (select fn_url from public.push_config where id = 1),
+  body := '{"setup": true}'::jsonb,
+  headers := jsonb_build_object('Content-Type', 'application/json', 'x-push-secret', (select secret from public.push_config where id = 1)));

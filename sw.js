@@ -2,7 +2,7 @@
    Pages and code always come fresh from the internet when there is a
    connection, so your changes on GitHub still show up straight away.
    Database requests are never stored here. */
-const CACHE = 'vazuva-v2';
+const CACHE = 'vazuva-v3';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'data.js', 'hero.jpg', 'icon-192.png'];
 
 self.addEventListener('install', e => {
@@ -34,4 +34,20 @@ self.addEventListener('fetch', e => {
     if (res.ok) { const copy = res.clone(); caches.open(CACHE).then(c => c.put(req, copy)); }
     return res;
   }).catch(() => caches.match(req).then(hit => hit || (req.mode === 'navigate' ? caches.match('index.html') : undefined))));
+});
+
+// Phone pop-ups sent by Vazuva.
+self.addEventListener('push', e => {
+  let d = {}; try { d = e.data ? e.data.json() : {}; } catch (err) { d = { title: 'Vazuva', body: e.data ? e.data.text() : '' }; }
+  e.waitUntil(self.registration.showNotification(d.title || 'Vazuva', {
+    body: d.body || '', icon: 'icon-192.png', badge: 'icon-192.png', tag: d.tag || undefined, data: { link: d.link || '#/notifications' }
+  }));
+});
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  const target = new URL('./' + (e.notification.data && e.notification.data.link || '#/notifications'), self.registration.scope).href;
+  e.waitUntil(clients.matchAll({ type: 'window', includeUncontrolled: true }).then(list => {
+    for (const c of list) if (c.url.startsWith(self.registration.scope)) { c.navigate(target); return c.focus(); }
+    return clients.openWindow(target);
+  }));
 });

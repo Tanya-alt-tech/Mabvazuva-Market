@@ -34,7 +34,7 @@ const ago = iso => {
   if (d < 60) return Math.floor(d / 7) + ' weeks ago'; return Math.floor(d / 30) + ' months ago';
 };
 
-let DB = { all: [], reviews: [], requests: [], events: [], counts: {}, payments: [], reports: [], ideas: [] };
+let DB = { all: [], reviews: [], requests: [], events: [], counts: {}, payments: [], reports: [], ideas: [], notes: [] };
 const PLAN_DAYS = 30, REMIND_DAYS = 5;
 const fmtDate = iso => new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
 const daysLeft = b => b.paid_until ? Math.ceil((new Date(b.paid_until).getTime() - Date.now()) / DAY) : null;
@@ -73,6 +73,10 @@ function seed() {
   return s;
 }
 const persist = () => ls.set(PKEY, S);
+function localNote(user, key, kind, title, body, link) {   // what the database triggers do on the live site
+  S.notes = S.notes || [];
+  S.notes.unshift({ id: uid(), user_id: user, device_key: key || null, kind, title, body: body || '', link: link || '', read: false, created_at: new Date().toISOString() });
+}
 function localReview(b) {   // same checks the database runs
   const others = S.biz.filter(x => x.id !== b.id && x.status !== 'rejected');
   if (String(b.tagline || '').trim().length < 5) return 'The one-line summary is missing or very short.';
@@ -85,9 +89,10 @@ function localReview(b) {   // same checks the database runs
 const local = {
   async session() { ME.user = S.user; ME.admin = !!S.user; },
   async load() {
-    S.payments = S.payments || []; S.reports = S.reports || [];
+    S.payments = S.payments || []; S.reports = S.reports || []; S.notes = S.notes || [];
     if (!S.ideas || S.ideas.some(i => i.kind === 'community')) S.ideas = seed().ideas;
     DB.ideas = S.ideas.slice();
+    DB.notes = S.notes.filter(n => (ME.user && n.user_id === 'local') || n.device_key === reporterKey()).sort((a, b) => a.created_at < b.created_at ? 1 : -1);
     const now = Date.now();
     S.biz.forEach(b => { if (b.plan !== 'starter' && b.paid_until && new Date(b.paid_until).getTime() < now) Object.assign(b, { lapsed_plan: b.plan, plan: 'starter', paid: false, featured: false, deal: '' }); });
     S.requests = S.requests.filter(r => now - new Date(r.created_at).getTime() < 14 * DAY);
@@ -107,7 +112,12 @@ const local = {
     S.user = null; persist(); await this.session();
   },
   async removePhotoFile() { },
-  async addIdea(o) { S.ideas.unshift(Object.assign({ id: uid(), kind: 'website', status: 'new', votes: 0, created_at: new Date().toISOString() }, o)); persist(); },
+  async addIdea(o) { S.ideas.unshift(Object.assign({ id: uid(), kind: 'website', status: 'new', votes: 0, created_at: new Date().toISOString() }, o)); localNote('local', null, 'suggestion', 'New suggestion', (o.topic ? o.topic + ': ' : '') + o.body, '#/admin'); persist(); },
+  async loadNotes() { DB.notes = (S.notes || []).filter(n => (ME.user && n.user_id === 'local') || n.device_key === reporterKey()).sort((a, b) => a.created_at < b.created_at ? 1 : -1); },
+  async markRead() { (S.notes || []).forEach(n => { if ((ME.user && n.user_id === 'local') || n.device_key === reporterKey()) n.read = true; }); persist(); },
+  async pushKey() { return null; },
+  async savePush() { },
+  async removePush() { },
   async setIdeaStatus(id, status) { S.ideas.find(x => x.id === id).status = status; persist(); },
   async deleteIdea(id) { S.ideas = S.ideas.filter(x => x.id !== id); persist(); },
   async setPassword() { if (!S.user) throw new Error('This reset link has expired. Ask for a new one.'); },
@@ -116,16 +126,21 @@ const local = {
     const b = Object.assign({ id: uid(), owner: 'local', plan: 'starter', paid: false, verified: false, featured: false, photos: [], prices: [], deal: '', paid_until: null, lapsed_plan: '', created_at: new Date().toISOString() }, o);
     const problem = localReview(b);
     b.status = problem ? 'pending' : 'approved'; b.review_note = problem;
-    S.biz.unshift(b); persist(); return b;
+    S.biz.unshift(b);
+    localNote('local', null, 'listing', problem ? 'Listing waiting for you' : 'New listing is live', problem ? b.name + ': ' + problem : b.name, problem ? '#/admin' : '#/b/' + b.id);
+    persist(); return b;
   },
   async claimPayment(o) {
     if (S.payments.some(p => p.business_id === o.business_id && p.status === 'pending')) throw new Error('duplicate key value violates unique constraint "payments_one_pending"');
-    S.payments.unshift(Object.assign({ id: uid(), owner: 'local', status: 'pending', created_at: new Date().toISOString() }, o)); persist();
+    S.payments.unshift(Object.assign({ id: uid(), owner: 'local', status: 'pending', created_at: new Date().toISOString() }, o));
+    const bn = (S.biz.find(b => b.id === o.business_id) || {}).name || 'a business';
+    localNote('local', null, 'payment', 'Payment to check', `$${o.amount} for ${C.plans[o.plan].name} from ${bn}, reference ${o.reference}`, '#/admin'); persist();
   },
   async confirmPayment(id, good) {
     const p = S.payments.find(x => x.id === id && x.status === 'pending'); if (!p) throw new Error('That payment was already handled.');
     p.status = good ? 'confirmed' : 'rejected';
     if (good) this.extendLocal(p.business_id, p.plan);
+    localNote('local', null, good ? 'paid' : 'unpaid', good ? `${C.plans[p.plan].name} plan is on` : 'Payment not found', good ? 'It runs for 30 days. Thank you!' : `The admin could not find reference ${p.reference}.`, '#/dashboard?id=' + p.business_id);
     persist();
   },
   extendLocal(id, plan) {
@@ -148,10 +163,20 @@ const local = {
   async deleteBiz(id) { S.biz = S.biz.filter(b => b.id !== id); persist(); },
   async addReview(o) { S.reviews.unshift(Object.assign({ id: uid(), created_at: new Date().toISOString() }, o)); persist(); },
   async deleteReview(id) { S.reviews = S.reviews.filter(r => r.id !== id); persist(); },
-  async addRequest(o) { S.requests.unshift(Object.assign({ id: uid(), replies: 0, created_at: new Date().toISOString() }, o)); persist(); },
+  async addRequest(o) {
+    S.requests.unshift(Object.assign({ id: uid(), replies: 0, offers: [], poster_key: reporterKey(), created_at: new Date().toISOString() }, o));
+    if (S.biz.some(b => b.owner === 'local' && b.status === 'approved' && b.cat === o.cat)) localNote('local', null, 'request', 'New request near you', o.need, '#/requests');
+    persist();
+  },
   async requestContact(id) {
     if (!ME.user) return { denied: true };
-    const r = S.requests.find(x => x.id === id); r.replies++; persist(); return { wa: r.wa || '' };
+    const r = S.requests.find(x => x.id === id); r.offers = r.offers || [];
+    if (!r.offers.includes('local')) {
+      r.offers.push('local'); r.replies++;
+      const bn = (S.biz.find(b => b.owner === 'local' && b.status === 'approved') || {}).name || 'A business';
+      if (r.poster_key) localNote(null, r.poster_key, 'offer', bn + ' can help', 'They saw your request and will message you on WhatsApp.', '#/requests');
+    }
+    persist(); return { wa: r.wa || '' };
   },
   async deleteRequest(id) { S.requests = S.requests.filter(r => r.id !== id); persist(); },
   async hit(id, kind) { const h = S.hits[id] || (S.hits[id] = { view: [0, 0, 0, 0], wa: [0, 0, 0, 0] }); h[kind][3]++; persist(); },
@@ -183,6 +208,7 @@ const live = {
       ME.admin ? sb.from('ideas').select('*').order('created_at', { ascending: false }) : Promise.resolve({ data: [] })
     ]);
     DB.ideas = ids.error ? [] : ids.data;
+    await this.loadNotes();
     DB.all = ok(b); DB.reviews = ok(r); DB.requests = ok(q); DB.events = ok(e);
     DB.payments = p.error ? [] : p.data; DB.reports = rp.error ? [] : rp.data;
     DB.counts = {}; (ok(c) || []).forEach(x => { DB.counts[x.business_id] = Number(x.contacts); });
@@ -197,6 +223,23 @@ const live = {
     await sb.auth.signOut({ scope: 'local' }).catch(() => {}); await this.session();
   },
   async addIdea(o) { ok(await sb.from('ideas').insert(o)); },
+  async loadNotes() {
+    const [mineN, dev] = await Promise.all([
+      ME.user ? sb.from('notifications').select('*').order('created_at', { ascending: false }).limit(50) : Promise.resolve({ data: [] }),
+      sb.rpc('device_notifications', { p_key: reporterKey() })
+    ]);
+    const all = [].concat(mineN.error ? [] : mineN.data || [], dev.error ? [] : dev.data || []), seenIds = {};
+    DB.notes = all.filter(n => !seenIds[n.id] && (seenIds[n.id] = 1)).sort((a, b) => a.created_at < b.created_at ? 1 : -1);
+  },
+  async markRead() {
+    await Promise.all([
+      ME.user ? sb.from('notifications').update({ read: true }).eq('read', false) : null,
+      sb.rpc('mark_device_read', { p_key: reporterKey() })
+    ].filter(Boolean).map(p => p.then(() => {}, () => {})));
+  },
+  async pushKey() { const r = await sb.rpc('get_push_key'); return r.error ? null : r.data; },
+  async savePush(j) { ok(await sb.rpc('save_push_subscription', { p_endpoint: j.endpoint, p_p256dh: j.keys.p256dh, p_auth: j.keys.auth, p_key: reporterKey() })); },
+  async removePush(endpoint) { await sb.rpc('remove_push_subscription', { p_endpoint: endpoint }).then(() => {}, () => {}); },
   async setIdeaStatus(id, status) { ok(await sb.from('ideas').update({ status }).eq('id', id)); },
   async deleteIdea(id) { ok(await sb.from('ideas').delete().eq('id', id)); },
   async removePhotoFile(url) { const p = photoPath(url); if (p) await sb.storage.from('photos').remove([p]).catch(() => {}); },
@@ -220,7 +263,7 @@ const live = {
   async deleteBiz(id) { ok(await sb.from('businesses').delete().eq('id', id)); },
   async addReview(o) { ok(await sb.from('reviews').insert(o)); },
   async deleteReview(id) { ok(await sb.from('reviews').delete().eq('id', id)); },
-  async addRequest(o) { ok(await sb.rpc('post_request', { p_need: o.need, p_when: o.when_text, p_name: o.name, p_cat: o.cat, p_wa: o.wa })); },
+  async addRequest(o) { ok(await sb.rpc('post_request', { p_need: o.need, p_when: o.when_text, p_name: o.name, p_cat: o.cat, p_wa: o.wa, p_key: reporterKey() })); },
   async requestContact(id) { const d = ok(await sb.rpc('request_contact', { p_id: id })); return d === null ? { denied: true } : { wa: d }; },
   async deleteRequest(id) { ok(await sb.from('requests').delete().eq('id', id)); },
   async hit(id, kind) { await sb.from('hits').insert({ business_id: id, kind }); },
@@ -473,7 +516,8 @@ function profile(parts) {
 function requestsPage() {
   return `<div class="wrap page">
     <h1>Request board</h1>
-    <p class="lead">Say what you need. Any Mabvazuva business that can help will message you on WhatsApp.</p>
+    <p class="lead">Say what you need. Any Mabvazuva business that can help will message you on WhatsApp, and you will be told on the bell here.</p>
+    ${pushState() === 'off' || pushState() === 'ios' ? pushCard('request') : ''}
     <form class="card-form" data-form="request">
       ${field('What do you need?', '<input name="need" required minlength="5" maxlength="300" placeholder="e.g. A plumber for a leaking geyser">')}
       <div class="two">
@@ -640,6 +684,7 @@ function account(parts, params) {
         <h2>Settings</h2>
         <div class="set-row"><div><p class="set-label">Appearance</p><p class="muted">Choose light or dark, or follow your phone.</p></div>
           <div class="seg" role="radiogroup" aria-label="Appearance">${opt('light', 'Light')}${opt('dark', 'Dark')}${opt('system', 'Match my phone')}</div></div>
+        <div class="set-row"><div><p class="set-label">Notifications</p><p class="muted">${pushOn() ? 'Pop-ups are on for this phone.' : 'See them on the bell, or turn on phone pop-ups.'}</p></div><p><a class="btn btn-line" href="#/notifications">Manage</a></p></div>
         <div class="set-row"><div><p class="set-label">App</p><p class="muted">Open ${esc(C.siteName)} from your home screen, like any app.</p></div>${installRow}</div>
         <details class="set-row set-details"><summary><span class="set-label">Change password</span></summary>
           <form data-form="newpass">
@@ -914,6 +959,84 @@ function tempPass() {
   const r = n => Math.floor(Math.random() * n);
   return words[r(words.length)] + (1000 + r(9000)) + words[r(words.length)];
 }
+/* ---------------- phone pop-ups ---------------- */
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+const pushOn = () => pushSupported() && Notification.permission === 'granted' && !!ls.get('mm_push_on');
+function pushState() {
+  if (!pushSupported()) return isIOS() && !standalone() ? 'ios' : 'unsupported';
+  if (Notification.permission === 'denied') return 'blocked';
+  return pushOn() ? 'on' : 'off';
+}
+function b64ToBytes(s) { const p = '='.repeat((4 - s.length % 4) % 4), b = atob((s + p).replace(/-/g, '+').replace(/_/g, '/')); return Uint8Array.from(b, c => c.charCodeAt(0)); }
+async function pushSubscribe() {
+  if (!LIVE) return toast('Phone pop-ups work on the live site, not in preview mode.');
+  if (!pushSupported()) return toast(isIOS() ? 'On iPhone, add Vazuva to your home screen first, then open it from there.' : 'This browser cannot show pop-ups. The bell still works.');
+  const key = await api.pushKey();
+  if (!key) return toast('Phone pop-ups are not switched on for the site yet. The bell still works.');
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') { render(true); return toast('Pop-ups were not allowed. You can allow them later in your browser settings.'); }
+  const reg = await navigator.serviceWorker.ready;
+  const sub = (await reg.pushManager.getSubscription()) || await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(key) });
+  await api.savePush(sub.toJSON()); ls.set('mm_push_on', 1);
+  toast('Pop-ups are on for this phone.'); render(true);
+}
+async function pushUnsubscribe() {
+  try { const reg = await navigator.serviceWorker.ready, sub = await reg.pushManager.getSubscription(); if (sub) { await api.removePush(sub.endpoint); await sub.unsubscribe(); } } catch (e) { /* already off */ }
+  ls.del('mm_push_on'); toast('Pop-ups are off for this phone. The bell still works.'); render(true);
+}
+async function pushResync(asGuest) {   // links this phone's pop-ups to whoever is signed in now
+  if (!LIVE || !pushOn()) return;
+  try { const reg = await navigator.serviceWorker.ready, sub = await reg.pushManager.getSubscription(); if (!sub) return;
+    if (asGuest) await api.removePush(sub.endpoint);
+    await api.savePush(sub.toJSON()); } catch (e) { /* try again next visit */ }
+}
+function pushCard(context) {
+  const st = pushState();
+  const why = context === 'request' ? 'Get a pop-up on this phone the moment a business offers to help.' : 'Get a pop-up on this phone, even when Vazuva is closed.';
+  const msg = { on: 'Pop-ups are on for this phone.', blocked: 'Pop-ups are blocked for this site. Allow notifications for vazuva.com in your browser settings to turn them on.',
+    ios: 'On iPhone, add Vazuva to your home screen first (in Safari, tap Share, then Add to Home Screen), then open it from there to turn on pop-ups.',
+    unsupported: 'This browser cannot show pop-ups. The bell on the site still works.', off: why }[st];
+  const btn = st === 'on' ? '<button type="button" class="btn btn-line btn-small" data-act="push-off">Turn off</button>'
+    : st === 'off' ? '<button type="button" class="btn btn-green btn-small" data-act="push-on">Turn on pop-ups</button>' : '';
+  return `<div class="push-card push-${st}"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="2" width="12" height="20" rx="2.5"></rect><path d="M11 18h2"></path></svg><p>${msg}</p>${btn}</div>`;
+}
+
+/* ---------------- notifications page ---------------- */
+const NOTE_ICON = { signup: 'person', listing: 'store', approved: 'store', rejected: 'store', payment: 'money', paid: 'money', unpaid: 'money', report: 'flag', suggestion: 'chat', request: 'hand', offer: 'hand', ending: 'clock', ended: 'clock' };
+const ICON_PATH = { person: '<circle cx="12" cy="8" r="4"></circle><path d="M4 21c0-4 4-6 8-6s8 2 8 6"></path>', store: '<path d="M4 10h16l-1.5-5h-13zM5 10v9h14v-9M10 19v-5h4v5"></path>',
+  money: '<rect x="3" y="6" width="18" height="12" rx="2"></rect><circle cx="12" cy="12" r="2.5"></circle>', flag: '<path d="M5 21V4h11l-2 4 2 4H5"></path>',
+  chat: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>', hand: '<path d="M7 11V6a2 2 0 0 1 4 0v4M11 9V4a2 2 0 0 1 4 0v6M15 8a2 2 0 0 1 4 0v6a7 7 0 0 1-7 7h-1a6 6 0 0 1-5-3l-2.5-4a1.8 1.8 0 0 1 3-2L7 14"></path>',
+  clock: '<circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 2"></path>', bell: '<path d="M18 16v-5a6 6 0 0 0-12 0v5l-2 2h16zM10 21h4"></path>' };
+const noteIcon = k => `<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICON_PATH[NOTE_ICON[k] || 'bell']}</svg>`;
+function notificationsPage() {
+  const list = DB.notes;
+  setTimeout(markAllRead, 600);
+  return `<div class="wrap page narrow">
+    <h1>Notifications</h1>
+    ${pushCard()}
+    ${list.length ? `<div class="notes">${list.map(n => `<${n.link ? `a href="${esc(n.link)}"` : 'div'} class="note${n.read ? '' : ' unread'}">
+      <span class="note-ic">${noteIcon(n.kind)}</span>
+      <span class="note-main"><span class="note-title">${esc(n.title)}</span>${n.body ? `<span class="note-body">${esc(n.body)}</span>` : ''}<span class="note-when">${ago(n.created_at)}</span></span>
+      ${n.read ? '' : '<span class="note-dot" aria-label="New"></span>'}</${n.link ? 'a' : 'div'}>`).join('')}</div>`
+      : `<div class="empty"><h2>Nothing yet</h2><p>${ME.user ? 'New requests, payments and updates about your listings will show here.' : 'Post a request and you will be told here when a business offers to help.'}</p></div>`}
+  </div>`;
+}
+async function markAllRead() {
+  if (!location.hash.startsWith('#/notifications') || !DB.notes.some(n => !n.read)) return;
+  await api.markRead(); DB.notes.forEach(n => { n.read = true; }); updateBell();
+}
+function updateBell() {
+  const n = DB.notes.filter(x => !x.read).length, el = $('#bell-n'), bell = $('#bell');
+  if (!el || !bell) return;
+  el.textContent = n > 9 ? '9+' : String(n); el.hidden = !n;
+  bell.setAttribute('aria-label', n ? `Notifications, ${n} new` : 'Notifications');
+}
+async function refreshNotes() {
+  try { await api.loadNotes(); updateBell(); if (location.hash.startsWith('#/notifications')) render(true); } catch (e) { /* offline */ }
+}
+setInterval(() => { if (document.visibilityState === 'visible') refreshNotes(); }, 60000);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') refreshNotes(); });
+
 /* ---------------- appearance ---------------- */
 const darkQuery = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
 const themePref = () => { try { const v = localStorage.getItem('mm_theme'); return v === 'dark' || v === 'system' ? v : 'light'; } catch (e) { return 'light'; } };
@@ -945,7 +1068,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
 const notFound = () => `<div class="wrap page narrow"><h1>That page is not here.</h1><p><a class="btn btn-green" href="#/">Back to the directory</a></p></div>`;
 
 /* ---------------- router ---------------- */
-const routes = { '': home, browse, b: profile, requests: requestsPage, deals: dealsPage, pricing, join, account, dashboard, admin, forgot, reset: resetPage, suggest: suggestPage, ideas: suggestPage };
+const routes = { '': home, browse, b: profile, requests: requestsPage, deals: dealsPage, pricing, join, account, dashboard, admin, forgot, reset: resetPage, suggest: suggestPage, ideas: suggestPage, notifications: notificationsPage };
 async function render(keepScroll) {
   const h = location.hash.replace(/^#\/?/, ''), cut = h.indexOf('?');
   const path = cut < 0 ? h : h.slice(0, cut), params = new URLSearchParams(cut < 0 ? '' : h.slice(cut + 1));
@@ -955,6 +1078,7 @@ async function render(keepScroll) {
   const key = parts[0] || 'home';
   document.querySelectorAll('[data-nav]').forEach(a => a.classList.toggle('on', a.dataset.nav === key));
   $('#nav-account').textContent = ME.user ? 'Account' : 'Sign in';
+  updateBell();
   $('#foot-admin').hidden = !ME.admin;
   document.body.classList.toggle('has-sticky', !!$('.sticky-wa'));
   fillInstall();
@@ -1024,7 +1148,7 @@ const forms = {
     const wa = digits(val(fd, 'wa'));
     if (wa.length < 9) return toast('Enter a full WhatsApp number so businesses can reach you.');
     await api.addRequest({ need: val(fd, 'need'), when_text: val(fd, 'when_text'), name: val(fd, 'name'), cat: val(fd, 'cat'), wa });
-    toast('Request posted. Businesses that can help will message you.'); await refresh();
+    toast(pushOn() ? 'Request posted. You will get a pop-up when a business offers to help.' : 'Request posted. Watch the bell for businesses offering to help.'); await refresh();
   },
   async edit(fd, f) {
     const prices = val(fd, 'prices').split('\n').map(l => l.trim()).filter(Boolean).map(l => { const i = l.lastIndexOf(' - '); return i < 0 ? [l, ''] : [l.slice(0, i).trim(), l.slice(i + 3).trim()]; }).slice(0, 20);
@@ -1059,6 +1183,7 @@ const forms = {
 async function afterSignIn() {
   const draft = ls.get('mm_draft');
   if (draft && ME.user) { const row = await api.createBiz(draft); ls.del('mm_draft'); toast(row.status === 'approved' ? 'Your listing is live.' : 'Your listing was sent for approval.'); }
+  pushResync(false);
   await api.load(); go(mine().length ? '#/dashboard' : '#/account');
 }
 
@@ -1067,7 +1192,7 @@ const acts = {
   wa(t) { api.hit(t.dataset.id, 'wa').catch(() => {}); },
   'wa-preview'(t) { api.hit(t.dataset.id, 'wa'); toast('Sample listing. On a real listing this opens a WhatsApp chat with the owner.'); },
   'join-back'() { J.step = Math.max(1, J.step - 1); render(); },
-  async signout() { await api.signOut(); await api.load(); go('#/'); },
+  async signout() { await api.signOut(); pushResync(true); await api.load(); go('#/'); },
   async respond(t) {
     if (!ME.user) return toast('Only listed businesses can reply. Sign in, or list your business free.');
     const r = await api.requestContact(t.dataset.id);
@@ -1107,6 +1232,8 @@ const acts = {
     try { await installEvt.userChoice; } catch (e) { /* closed */ }
     installEvt = null; fillInstall();
   },
+  async 'push-on'() { await pushSubscribe(); },
+  async 'push-off'() { await pushUnsubscribe(); },
   'install-hide'() { ls.set('mm_install_hidden', 1); fillInstall(); },
   'preview-reset'() { ls.del(PKEY); S = seed(); persist(); api.session().then(refresh); toast('Preview reset to the sample data.'); }
 };
@@ -1177,6 +1304,7 @@ window.addEventListener('hashchange', () => render());
     const clean = h => history.replaceState(null, '', location.pathname + location.search + h);
     if (RECOVERY) clean('#/reset');
     else if (LINK_ERROR) clean('#/forgot?expired=1');
+    if (ME.user) pushResync(false);
   } catch (e) { toast(nice(e)); }
   render();
 })();
