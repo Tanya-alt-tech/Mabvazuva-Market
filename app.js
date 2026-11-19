@@ -91,10 +91,16 @@ const local = {
     DB.requests = S.requests.map(r => { const c = Object.assign({}, r); delete c.wa; return c; });
     DB.counts = {}; S.biz.forEach(b => { DB.counts[b.id] = (S.hits[b.id] || { wa: [0, 0, 0, 0] }).wa[3]; });
   },
-  async signUp(email) { S.user = { id: 'local', email }; persist(); await this.session(); return true; },
-  async signIn(email) { S.user = { id: 'local', email }; persist(); await this.session(); },
+  async signUp(email) { S.user = { id: 'local', email, since: new Date().toISOString() }; persist(); await this.session(); return true; },
+  async signIn(email) { S.user = { id: 'local', email, since: (S.user && S.user.since) || new Date().toISOString() }; persist(); await this.session(); },
   async signOut() { S.user = null; persist(); await this.session(); },
   async sendReset() { return 'preview'; },
+  async deleteAccount() {
+    const ids = S.biz.filter(b => b.owner === 'local').map(b => b.id);
+    S.biz = S.biz.filter(b => b.owner !== 'local'); S.payments = (S.payments || []).filter(p => !ids.includes(p.business_id));
+    S.user = null; persist(); await this.session();
+  },
+  async removePhotoFile() { },
   async setPassword() { if (!S.user) throw new Error('This reset link has expired. Ask for a new one.'); },
   async adminSetPassword() { },
   async createBiz(o) {
@@ -152,7 +158,7 @@ const live = {
   async session() {
     const { data } = await sb.auth.getSession();
     const u = data && data.session && data.session.user;
-    ME.user = u ? { id: u.id, email: u.email } : null; ME.admin = false;
+    ME.user = u ? { id: u.id, email: u.email, since: u.created_at } : null; ME.admin = false;
     if (u) { const r = await sb.rpc('is_admin'); ME.admin = !r.error && r.data === true; }
   },
   async load() {
@@ -173,6 +179,13 @@ const live = {
   async signUp(email, pw) { const d = ok(await sb.auth.signUp({ email, password: pw })); await this.session(); return !!(d && d.session); },
   async signIn(email, pw) { ok(await sb.auth.signInWithPassword({ email, password: pw })); await this.session(); },
   async signOut() { await sb.auth.signOut(); await this.session(); },
+  async deleteAccount() {
+    const paths = mine().flatMap(b => b.photos || []).map(photoPath).filter(Boolean);
+    if (paths.length) await sb.storage.from('photos').remove(paths).catch(() => {});
+    ok(await sb.rpc('delete_my_account'));
+    await sb.auth.signOut({ scope: 'local' }).catch(() => {}); await this.session();
+  },
+  async removePhotoFile(url) { const p = photoPath(url); if (p) await sb.storage.from('photos').remove([p]).catch(() => {}); },
   async sendReset(email) {
     const r = await sb.auth.resetPasswordForEmail(email, { redirectTo: siteUrl() });
     if (!r.error) return 'sent';
@@ -212,6 +225,7 @@ const live = {
   async deleteEvent(id) { ok(await sb.from('events').delete().eq('id', id)); }
 };
 const api = LIVE ? live : local;
+function photoPath(url) { const m = String(url || '').match(/\/object\/public\/photos\/(.+)$/); return m ? decodeURIComponent(m[1]) : ''; }
 
 /* ---------------- derived data ---------------- */
 const RANK = { premium: 0, growth: 1, starter: 2 };
@@ -574,18 +588,73 @@ function join(parts, params) {
 
 function account(parts, params) {
   if (ME.user) {
-    const m = mine();
-    return `<div class="wrap page narrow"><h1>Your account</h1>
-      <p class="lead">Signed in as ${esc(ME.user.email)}.</p>
-      ${m.length ? `<div class="rows">${m.map(b => `<a class="row" href="#/dashboard?id=${esc(b.id)}">${plaque(b)}<span class="row-main"><span class="row-name">${esc(b.name)}</span><span class="row-meta">${statusText(b)}</span></span></a>`).join('')}</div>`
-        : '<p>You have no listing yet. <a href="#/join">List your business</a>.</p>'}
-      <p>${ME.admin ? '<a class="btn btn-green" href="#/admin">Open admin</a> ' : ''}<button class="btn btn-line" type="button" data-act="signout">Sign out</button></p>
-      <details class="add-review"><summary>Change password</summary>
-        <form data-form="newpass">
-          ${field('New password', '<input name="password" type="password" required minlength="6" autocomplete="new-password">', 'At least 6 characters.')}
-          ${field('Type it again', '<input name="password2" type="password" required minlength="6" autocomplete="new-password">')}
-          <button class="btn btn-green" type="submit">Save new password</button>
-        </form></details></div>`;
+    const m = mine(), email = ME.user.email || '';
+    const initials = (email.split('@')[0].replace(/[^a-z0-9]/gi, ' ').trim().split(/\s+/).slice(0, 2).map(w => w[0]).join('') || '?').toUpperCase();
+    const role = ME.admin ? 'Admin' : m.length ? 'Business owner' : 'Member';
+    const weekContacts = m.reduce((n, b) => n + contacts(b), 0);
+    const claims = DB.payments.filter(x => x.status === 'pending').length, waitingN = DB.all.filter(b => b.status === 'pending').length;
+    const pref = themePref();
+    const opt = (v, label) => `<label class="seg-opt"><input type="radio" name="theme" value="${v}" data-change="theme"${pref === v ? ' checked' : ''}><span>${label}</span></label>`;
+    const installRow = standalone() ? '<p class="muted">Vazuva is on your home screen.</p>'
+      : installEvt ? '<p><button class="btn btn-line" type="button" data-act="install">Add to home screen</button></p>'
+      : isIOS() ? '<p class="muted">In Safari, tap the Share button, then <em>Add to Home Screen</em>.</p>'
+      : '<p class="muted">Open the menu in your browser and choose <em>Add to home screen</em> or <em>Install app</em>.</p>';
+    return `<div class="wrap page narrow acct">
+      <section class="acct-head">
+        <span class="avatar" aria-hidden="true">${esc(initials)}</span>
+        <div><h1>Your account</h1>
+          <p class="acct-email">${esc(email)}</p>
+          <p class="acct-meta"><span class="role role-${role === 'Admin' ? 'admin' : 'owner'}">${role}</span>${ME.user.since ? `<span class="sep"></span>Member since ${new Date(ME.user.since).toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })}` : ''}</p></div>
+      </section>
+
+      ${ME.admin ? `<section class="acct-card acct-admin">
+        <div><h2>Admin</h2><p>${claims ? plural(claims, 'payment', 'payments') + ' to check' : 'No payments to check'}<span class="sep"></span>${waitingN ? plural(waitingN, 'listing', 'listings') + ' waiting' : 'No listings waiting'}</p></div>
+        <a class="btn btn-brass" href="#/admin">Open admin</a></section>` : ''}
+
+      <section>
+        <div class="sec-head"><h2>Your businesses</h2>${m.length ? '<a href="#/join">List another</a>' : ''}</div>
+        ${m.length ? `${weekContacts ? `<p class="muted">${plural(weekContacts, 'neighbour', 'neighbours')} contacted your ${m.length === 1 ? 'business' : 'businesses'} on WhatsApp this week.</p>` : ''}
+        <div class="biz-cards">${m.map(b => `<div class="biz-card">
+          <div class="biz-top">${plaque(b)}<div><p class="biz-name">${esc(b.name)}</p><p class="muted">${statusText(b)}</p></div></div>
+          <p class="biz-acts"><a class="btn btn-green btn-small" href="#/dashboard?id=${esc(b.id)}">Dashboard</a>
+          ${b.status === 'approved' ? `<a class="btn btn-line btn-small" href="#/b/${esc(b.id)}">View listing</a>
+          <a class="btn btn-line btn-small" href="https://wa.me/?text=${encodeURIComponent(`Find ${b.name} on ${C.siteName}: ${siteUrl()}#/b/${b.id}`)}" target="_blank" rel="noopener">Share</a>` : ''}</p></div>`).join('')}</div>`
+        : `<div class="empty"><h2>No business listed yet</h2><p>It takes under two minutes, and Starter is free.</p><p><a class="btn btn-green" href="#/join">List your business</a></p></div>`}
+      </section>
+
+      <section class="acct-card">
+        <h2>Settings</h2>
+        <div class="set-row"><div><p class="set-label">Appearance</p><p class="muted">Choose light or dark, or follow your phone.</p></div>
+          <div class="seg" role="radiogroup" aria-label="Appearance">${opt('light', 'Light')}${opt('dark', 'Dark')}${opt('system', 'Match my phone')}</div></div>
+        <div class="set-row"><div><p class="set-label">App</p><p class="muted">Open ${esc(C.siteName)} from your home screen, like any app.</p></div>${installRow}</div>
+        <details class="set-row set-details"><summary><span class="set-label">Change password</span></summary>
+          <form data-form="newpass">
+            ${field('New password', '<input name="password" type="password" required minlength="6" autocomplete="new-password">', 'At least 6 characters.')}
+            ${field('Type it again', '<input name="password2" type="password" required minlength="6" autocomplete="new-password">')}
+            <button class="btn btn-green" type="submit">Save new password</button>
+          </form></details>
+      </section>
+
+      <section class="acct-card">
+        <h2>Help</h2>
+        <p class="muted">Questions about your listing, a payment or anything else.</p>
+        <p>${C.adminWhatsApp ? `<a class="btn btn-wa" href="${waLink(C.adminWhatsApp, `Hi, I need help with my ${C.siteName} account (${email}).`)}" target="_blank" rel="noopener">Message the admin</a> ` : ''}<a class="btn btn-line" href="#/pricing">Plans and prices</a></p>
+      </section>
+
+      <p class="acct-out"><button class="btn btn-line" type="button" data-act="signout">Sign out</button></p>
+
+      <section class="danger">
+        <h2>Delete account</h2>
+        ${ME.admin ? '<p class="muted">The admin account cannot be deleted from here. This keeps the directory from being lost by accident.</p>' : `
+        <p>This permanently removes your login${m.length ? `, ${m.length === 1 ? 'your business' : `your ${m.length} businesses`} (${m.map(b => esc(b.name)).join(', ')}), their photos and your payment history` : ''}. It cannot be undone.</p>
+        ${m.some(b => b.plan !== 'starter' && b.paid) ? '<p class="notice notice-warn">You have a paid plan running. Deleting your account ends it, and the remaining days are not refunded.</p>' : ''}
+        <details><summary>Delete my account</summary>
+          <form data-form="delete-account">
+            ${field('Type DELETE to confirm', '<input name="confirm" required autocomplete="off" autocapitalize="characters">')}
+            <button class="btn btn-danger" type="submit">Delete my account for good</button>
+          </form></details>`}
+      </section>
+    </div>`;
   }
   const isNewAcc = params.get('mode') === 'new';
   return `<div class="wrap page narrow"><h1>${isNewAcc ? 'Create an account' : 'Sign in'}</h1>
@@ -807,6 +876,16 @@ function tempPass() {
   const r = n => Math.floor(Math.random() * n);
   return words[r(words.length)] + (1000 + r(9000)) + words[r(words.length)];
 }
+/* ---------------- appearance ---------------- */
+const darkQuery = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+const themePref = () => { try { const v = localStorage.getItem('mm_theme'); return v === 'dark' || v === 'system' ? v : 'light'; } catch (e) { return 'light'; } };
+function applyTheme() {
+  const t = themePref(), dark = t === 'dark' || (t === 'system' && darkQuery && darkQuery.matches);
+  document.documentElement.toggleAttribute('data-theme', false);
+  if (dark) document.documentElement.setAttribute('data-theme', 'dark');
+}
+if (darkQuery && darkQuery.addEventListener) darkQuery.addEventListener('change', () => { if (themePref() === 'system') applyTheme(); });
+
 /* ---------------- add to home screen ---------------- */
 let installEvt = null;
 const standalone = () => (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
@@ -868,6 +947,11 @@ const forms = {
     J.step = 4; J.id = row.id; J.status = row.status; await api.load(); go('#/join');
   },
   async signin(fd) { await api.signIn(val(fd, 'email'), val(fd, 'password')); await afterSignIn(); },
+  async 'delete-account'(fd) {
+    if (val(fd, 'confirm').toUpperCase() !== 'DELETE') return toast('Type DELETE in capitals to confirm.');
+    await api.deleteAccount(); await api.load(); go('#/');
+    toast('Your account and listings have been deleted.');
+  },
   async forgot(fd) {
     const email = val(fd, 'email'), r = await api.sendReset(email);
     go('#/forgot?' + new URLSearchParams({ s: r, e: email }).toString());
@@ -951,7 +1035,8 @@ const acts = {
   },
   async 'photo-del'(t) {
     const b = byId(t.dataset.id), photos = (b.photos || []).slice(); photos.splice(Number(t.dataset.i), 1);
-    await api.updateBiz(b.id, { photos }); await refresh();
+    const gone = (b.photos || [])[Number(t.dataset.i)];
+    await api.updateBiz(b.id, { photos }); api.removePhotoFile(gone); await refresh();
   },
   async 'adm-status'(t) { await api.updateBiz(t.dataset.id, t.dataset.v === 'approved' ? { status: 'approved', review_note: '' } : { status: t.dataset.v }); toast(t.dataset.v === 'approved' ? 'Approved. The listing is live.' : 'Rejected.'); await refresh(); },
   async 'adm-pay'(t) {
@@ -983,6 +1068,7 @@ const acts = {
   'preview-reset'() { ls.del(PKEY); S = seed(); persist(); api.session().then(refresh); toast('Preview reset to the sample data.'); }
 };
 const changes = {
+  theme(t) { try { localStorage.setItem('mm_theme', t.value); } catch (e) { /* storage blocked */ } applyTheme(); },
   'pay-plan'(t) { const a = t.form.querySelector('[name=amount]'); if (a) a.value = priceNow(t.value); },
   async 'adm-plan'(t) {
     const p = { plan: t.value }; if (t.value !== 'premium') p.featured = false; if (t.value === 'starter') Object.assign(p, { paid: false, paid_until: null, lapsed_plan: '' });

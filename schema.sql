@@ -401,3 +401,27 @@ grant execute on function public.admin_confirm_payment(uuid, boolean) to authent
 grant execute on function public.admin_extend(uuid, text) to authenticated;
 grant execute on function public.report_listing(uuid, text, text) to anon, authenticated;
 grant execute on function public.housekeeping() to anon, authenticated;
+
+
+-- =====================================================================
+-- Vazuva: delete account, and photo clean-up.
+-- Paste this whole file into Supabase > SQL Editor > New query > Run.
+-- Safe to run again if you are not sure it worked.
+-- =====================================================================
+
+-- An owner deletes their own account. Their businesses, payments and
+-- profile go with it. The admin account cannot be deleted this way.
+create or replace function public.delete_my_account()
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if auth.uid() is null then raise exception 'Sign in first.'; end if;
+  if public.is_admin() then raise exception 'The admin account cannot be deleted from here.'; end if;
+  delete from auth.users where id = auth.uid();
+end $$;
+revoke execute on function public.delete_my_account() from public, anon;
+grant execute on function public.delete_my_account() to authenticated;
+
+-- Owners can delete photo files they uploaded themselves.
+drop policy if exists "people delete their own photos" on storage.objects;
+create policy "people delete their own photos" on storage.objects for delete to authenticated
+  using (bucket_id = 'photos' and owner_id = (select auth.uid()::text));
