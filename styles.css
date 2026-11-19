@@ -395,3 +395,8 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent-text); }
 .danger form { margin-top: 14px; }
 .btn-danger { background: var(--danger); color: #fff; }
 [data-theme=dark] .btn-danger { color: #111814; }
+
+/* suggestions (admin list) */
+.adm-ideas { padding-left: 0; }
+.adm-ideas li { list-style: none; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 16px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.adm-ideas select { min-height: 36px !important; width: auto !important; padding: 4px 8px !important; }

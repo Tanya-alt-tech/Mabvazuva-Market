@@ -425,3 +425,42 @@ grant execute on function public.delete_my_account() to authenticated;
 drop policy if exists "people delete their own photos" on storage.objects;
 create policy "people delete their own photos" on storage.objects for delete to authenticated
   using (bucket_id = 'photos' and owner_id = (select auth.uid()::text));
+
+
+-- =====================================================================
+-- Vazuva: private website suggestions (only the admin sees them).
+-- Paste this whole file into Supabase > SQL Editor > New query > Run.
+-- Safe to run again, and works whether or not you ran ideas-update.sql.
+-- =====================================================================
+
+create table if not exists public.ideas (
+  id uuid primary key default gen_random_uuid(),
+  kind text not null default 'website' check (kind in ('community', 'website')),
+  body text not null check (char_length(body) between 5 and 600),
+  name text not null default '' check (char_length(name) <= 40),
+  status text not null default 'new' check (status in ('new', 'planned', 'done')),
+  votes int not null default 0,
+  created_at timestamptz not null default now()
+);
+alter table public.ideas add column if not exists topic text not null default '';
+alter table public.ideas enable row level security;
+
+-- The public board is gone: remove its ideas, votes and rules.
+delete from public.ideas where kind = 'community';
+drop function if exists public.vote_idea(uuid, text);
+drop table if exists public.idea_votes;
+drop policy if exists "read community ideas" on public.ideas;
+drop policy if exists "anyone shares an idea" on public.ideas;
+
+-- Anyone can send a suggestion. Only the admin can read, update or remove them.
+drop policy if exists "admin reads suggestions" on public.ideas;
+create policy "admin reads suggestions" on public.ideas for select to authenticated using (public.is_admin());
+drop policy if exists "anyone sends a suggestion" on public.ideas;
+create policy "anyone sends a suggestion" on public.ideas for insert
+  with check (kind = 'website' and status = 'new' and votes = 0 and char_length(topic) <= 40);
+drop policy if exists "admin updates ideas" on public.ideas;
+create policy "admin updates ideas" on public.ideas for update to authenticated using (public.is_admin()) with check (public.is_admin());
+drop policy if exists "admin removes ideas" on public.ideas;
+create policy "admin removes ideas" on public.ideas for delete to authenticated using (public.is_admin());
+grant insert on public.ideas to anon, authenticated;
+grant select, update, delete on public.ideas to authenticated;

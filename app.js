@@ -34,7 +34,7 @@ const ago = iso => {
   if (d < 60) return Math.floor(d / 7) + ' weeks ago'; return Math.floor(d / 30) + ' months ago';
 };
 
-let DB = { all: [], reviews: [], requests: [], events: [], counts: {}, payments: [], reports: [] };
+let DB = { all: [], reviews: [], requests: [], events: [], counts: {}, payments: [], reports: [], ideas: [] };
 const PLAN_DAYS = 30, REMIND_DAYS = 5;
 const fmtDate = iso => new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
 const daysLeft = b => b.paid_until ? Math.ceil((new Date(b.paid_until).getTime() - Date.now()) / DAY) : null;
@@ -66,6 +66,10 @@ function seed() {
   s.requests = SAMPLE.requests.map(r => Object.assign({}, r, { wa: '', created_at: iso(r.daysAgo) }));
   s.events = SAMPLE.events.map(e => Object.assign({}, e));
   s.payments = []; s.reports = [];
+  s.ideas = [
+    { id: 'i1', kind: 'website', topic: 'An idea for a new feature', body: 'A map showing where each business is in the estate.', name: 'Rudo', status: 'new', votes: 0, created_at: iso(3) },
+    { id: 'i2', kind: 'website', topic: 'Something is not working', body: 'The photo upload was slow on my phone.', name: '', status: 'planned', votes: 0, created_at: iso(6) }
+  ];
   return s;
 }
 const persist = () => ls.set(PKEY, S);
@@ -82,6 +86,8 @@ const local = {
   async session() { ME.user = S.user; ME.admin = !!S.user; },
   async load() {
     S.payments = S.payments || []; S.reports = S.reports || [];
+    if (!S.ideas || S.ideas.some(i => i.kind === 'community')) S.ideas = seed().ideas;
+    DB.ideas = S.ideas.slice();
     const now = Date.now();
     S.biz.forEach(b => { if (b.plan !== 'starter' && b.paid_until && new Date(b.paid_until).getTime() < now) Object.assign(b, { lapsed_plan: b.plan, plan: 'starter', paid: false, featured: false, deal: '' }); });
     S.requests = S.requests.filter(r => now - new Date(r.created_at).getTime() < 14 * DAY);
@@ -101,6 +107,9 @@ const local = {
     S.user = null; persist(); await this.session();
   },
   async removePhotoFile() { },
+  async addIdea(o) { S.ideas.unshift(Object.assign({ id: uid(), kind: 'website', status: 'new', votes: 0, created_at: new Date().toISOString() }, o)); persist(); },
+  async setIdeaStatus(id, status) { S.ideas.find(x => x.id === id).status = status; persist(); },
+  async deleteIdea(id) { S.ideas = S.ideas.filter(x => x.id !== id); persist(); },
   async setPassword() { if (!S.user) throw new Error('This reset link has expired. Ask for a new one.'); },
   async adminSetPassword() { },
   async createBiz(o) {
@@ -163,15 +172,17 @@ const live = {
   },
   async load() {
     await sb.rpc('housekeeping').then(() => {}, () => {});
-    const [b, r, q, e, c, p, rp] = await Promise.all([
+    const [b, r, q, e, c, p, rp, ids] = await Promise.all([
       sb.from('businesses').select('*').order('created_at', { ascending: false }),
       sb.from('reviews').select('*').order('created_at', { ascending: false }),
       sb.from('requests').select('*').order('created_at', { ascending: false }),
       sb.from('events').select('*').order('created_at', { ascending: true }),
       sb.rpc('public_counts'),
       ME.user ? sb.from('payments').select('*').order('created_at', { ascending: false }) : Promise.resolve({ data: [] }),
-      ME.admin ? sb.from('reports').select('*').order('created_at', { ascending: false }) : Promise.resolve({ data: [] })
+      ME.admin ? sb.from('reports').select('*').order('created_at', { ascending: false }) : Promise.resolve({ data: [] }),
+      ME.admin ? sb.from('ideas').select('*').order('created_at', { ascending: false }) : Promise.resolve({ data: [] })
     ]);
+    DB.ideas = ids.error ? [] : ids.data;
     DB.all = ok(b); DB.reviews = ok(r); DB.requests = ok(q); DB.events = ok(e);
     DB.payments = p.error ? [] : p.data; DB.reports = rp.error ? [] : rp.data;
     DB.counts = {}; (ok(c) || []).forEach(x => { DB.counts[x.business_id] = Number(x.contacts); });
@@ -185,6 +196,9 @@ const live = {
     ok(await sb.rpc('delete_my_account'));
     await sb.auth.signOut({ scope: 'local' }).catch(() => {}); await this.session();
   },
+  async addIdea(o) { ok(await sb.from('ideas').insert(o)); },
+  async setIdeaStatus(id, status) { ok(await sb.from('ideas').update({ status }).eq('id', id)); },
+  async deleteIdea(id) { ok(await sb.from('ideas').delete().eq('id', id)); },
   async removePhotoFile(url) { const p = photoPath(url); if (p) await sb.storage.from('photos').remove([p]).catch(() => {}); },
   async sendReset(email) {
     const r = await sb.auth.resetPasswordForEmail(email, { redirectTo: siteUrl() });
@@ -638,7 +652,7 @@ function account(parts, params) {
       <section class="acct-card">
         <h2>Help</h2>
         <p class="muted">Questions about your listing, a payment or anything else.</p>
-        <p>${C.adminWhatsApp ? `<a class="btn btn-wa" href="${waLink(C.adminWhatsApp, `Hi, I need help with my ${C.siteName} account (${email}).`)}" target="_blank" rel="noopener">Message the admin</a> ` : ''}<a class="btn btn-line" href="#/pricing">Plans and prices</a></p>
+        <p>${C.adminWhatsApp ? `<a class="btn btn-wa" href="${waLink(C.adminWhatsApp, `Hi, I need help with my ${C.siteName} account (${email}).`)}" target="_blank" rel="noopener">Message the admin</a> ` : ''}<a class="btn btn-line" href="#/pricing">Plans and prices</a> <a class="btn btn-line" href="#/suggest">Suggest an improvement</a></p>
       </section>
 
       <p class="acct-out"><button class="btn btn-line" type="button" data-act="signout">Sign out</button></p>
@@ -833,12 +847,36 @@ function admin() {
         ${field('Temporary password', `<input name="password" required minlength="6" autocomplete="off" value="${tempPass()}">`, 'Already filled in for you. Change it if you like.')}
       </div><button class="btn btn-green" type="submit">Set password</button></form></section>
 
+    <section><h2>Suggestions</h2>
+      <p class="muted">From residents and owners, about the website. Only you see these.</p>
+      ${DB.ideas.length ? `<ul class="adm-list adm-ideas">${DB.ideas.map(i => `<li><span>${i.topic ? `<strong>${esc(i.topic)}:</strong> ` : ''}${esc(i.body)} <span class="muted">${i.name ? esc(i.name) + ', ' : ''}${ago(i.created_at)}</span></span>
+        <span class="adm-acts"><select data-change="idea-status" data-id="${esc(i.id)}" aria-label="Status">${['new', 'planned', 'done'].map(x => `<option value="${x}"${i.status === x ? ' selected' : ''}>${STATUS[x]}</option>`).join('')}</select>
+        <button type="button" class="link danger" data-act="adm-del" data-kind="Idea" data-id="${esc(i.id)}">Remove</button></span></li>`).join('')}</ul>` : '<p class="muted">No suggestions yet.</p>'}
+    </section>
+
     <section><h2>Requests</h2><ul class="adm-list">${DB.requests.map(r => `<li>${esc(r.name)}: ${esc(r.need)} <button type="button" class="link danger" data-act="adm-del" data-kind="Request" data-id="${esc(r.id)}">Remove</button></li>`).join('') || '<li class="muted">None.</li>'}</ul></section>
 
     <section><h2>Reviews</h2><ul class="adm-list">${DB.reviews.map(r => `<li>${'★'.repeat(r.stars)} ${esc(r.name)} on ${esc((byId(r.business_id) || {}).name || 'deleted business')}: ${esc(r.body)} <button type="button" class="link danger" data-act="adm-del" data-kind="Review" data-id="${esc(r.id)}">Remove</button></li>`).join('') || '<li class="muted">None.</li>'}</ul></section>
   </div>`;
 }
 
+const STATUS = { new: 'New', planned: 'Planned', done: 'Done' };
+const TOPICS = ['Something is not working', 'An idea for a new feature', 'Something else'];
+function suggestPage(parts, params) {
+  if (params.get('sent')) return `<div class="wrap page narrow"><div class="done-box"><h1>Thank you.</h1>
+    <p>Your suggestion went straight to the admin. Every one is read, and the best ideas end up on the site.</p>
+    <p><a class="btn btn-green" href="#/">Back to the directory</a> <a class="btn btn-line" href="#/suggest">Send another</a></p></div></div>`;
+  return `<div class="wrap page narrow">
+    <h1>Suggest an improvement</h1>
+    <p class="lead">Something not working, or a feature you wish ${esc(C.siteName)} had? Tell us. Only the admin sees what you send.</p>
+    <form class="card-form" data-form="idea">
+      ${field('What is it about?', `<select name="topic">${TOPICS.map(t => `<option>${t}</option>`).join('')}</select>`)}
+      ${field('Your suggestion', '<textarea name="body" required minlength="5" maxlength="600" rows="4" placeholder="e.g. A map showing where each business is"></textarea>')}
+      ${field('Your first name', `<input name="name" maxlength="40" autocomplete="given-name"${ME.user ? '' : ''}>`, 'Optional.')}
+      <button class="btn btn-green" type="submit">Send suggestion</button>
+    </form>
+  </div>`;
+}
 const adminHelp = (email) => C.adminWhatsApp
   ? `<a class="btn btn-wa" href="${waLink(C.adminWhatsApp, `Hi, I have forgotten my ${C.siteName} password.${email ? ' My login email is ' + email + '.' : ''}`)}" target="_blank" rel="noopener">Ask the admin on WhatsApp</a>`
   : '';
@@ -907,7 +945,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
 const notFound = () => `<div class="wrap page narrow"><h1>That page is not here.</h1><p><a class="btn btn-green" href="#/">Back to the directory</a></p></div>`;
 
 /* ---------------- router ---------------- */
-const routes = { '': home, browse, b: profile, requests: requestsPage, deals: dealsPage, pricing, join, account, dashboard, admin, forgot, reset: resetPage };
+const routes = { '': home, browse, b: profile, requests: requestsPage, deals: dealsPage, pricing, join, account, dashboard, admin, forgot, reset: resetPage, suggest: suggestPage, ideas: suggestPage };
 async function render(keepScroll) {
   const h = location.hash.replace(/^#\/?/, ''), cut = h.indexOf('?');
   const path = cut < 0 ? h : h.slice(0, cut), params = new URLSearchParams(cut < 0 ? '' : h.slice(cut + 1));
@@ -947,6 +985,11 @@ const forms = {
     J.step = 4; J.id = row.id; J.status = row.status; await api.load(); go('#/join');
   },
   async signin(fd) { await api.signIn(val(fd, 'email'), val(fd, 'password')); await afterSignIn(); },
+  async idea(fd) {
+    await api.addIdea({ kind: 'website', topic: val(fd, 'topic'), body: val(fd, 'body'), name: val(fd, 'name') });
+    if (ME.admin) await api.load();
+    go('#/suggest?sent=1');
+  },
   async 'delete-account'(fd) {
     if (val(fd, 'confirm').toUpperCase() !== 'DELETE') return toast('Type DELETE in capitals to confirm.');
     await api.deleteAccount(); await api.load(); go('#/');
@@ -1069,6 +1112,7 @@ const acts = {
 };
 const changes = {
   theme(t) { try { localStorage.setItem('mm_theme', t.value); } catch (e) { /* storage blocked */ } applyTheme(); },
+  async 'idea-status'(t) { await api.setIdeaStatus(t.dataset.id, t.value); toast('Status updated.'); await refresh(); },
   'pay-plan'(t) { const a = t.form.querySelector('[name=amount]'); if (a) a.value = priceNow(t.value); },
   async 'adm-plan'(t) {
     const p = { plan: t.value }; if (t.value !== 'premium') p.featured = false; if (t.value === 'starter') Object.assign(p, { paid: false, paid_until: null, lapsed_plan: '' });
