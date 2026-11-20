@@ -34,7 +34,7 @@ const ago = iso => {
   if (d < 60) return Math.floor(d / 7) + ' weeks ago'; return Math.floor(d / 30) + ' months ago';
 };
 
-let DB = { all: [], reviews: [], requests: [], events: [], counts: {}, payments: [], reports: [], ideas: [], notes: [] };
+let DB = { all: [], reviews: [], requests: [], events: [], counts: {}, payments: [], reports: [], ideas: [], notes: [], promo: { free_left: 0, founding_left: 0 } };
 const PLAN_DAYS = 30, REMIND_DAYS = 5;
 const fmtDate = iso => new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
 const daysLeft = b => b.paid_until ? Math.ceil((new Date(b.paid_until).getTime() - Date.now()) / DAY) : null;
@@ -77,6 +77,10 @@ function localNote(user, key, kind, title, body, link) {   // what the database 
   S.notes = S.notes || [];
   S.notes.unshift({ id: uid(), user_id: user, device_key: key || null, kind, title, body: body || '', link: link || '', read: false, created_at: new Date().toISOString() });
 }
+function localPromo() {     // same counter the database keeps
+  const used = k => S.biz.filter(b => b.promo === k && b.status !== 'rejected').length;
+  return { free_left: Math.max(0, PROMO_SPOTS - used('free')), founding_left: Math.max(0, PROMO_SPOTS - used('founding')) };
+}
 function localReview(b) {   // same checks the database runs
   const others = S.biz.filter(x => x.id !== b.id && x.status !== 'rejected');
   if (String(b.tagline || '').trim().length < 5) return 'The one-line summary is missing or very short.';
@@ -101,6 +105,7 @@ const local = {
     DB.all = S.biz.slice(); DB.reviews = S.reviews.slice(); DB.events = S.events.slice();
     DB.requests = S.requests.map(r => { const c = Object.assign({}, r); delete c.wa; return c; });
     DB.counts = {}; S.biz.forEach(b => { DB.counts[b.id] = (S.hits[b.id] || { wa: [0, 0, 0, 0] }).wa[3]; });
+    DB.promo = localPromo();
   },
   async signUp(email) { S.user = { id: 'local', email, since: new Date().toISOString() }; persist(); await this.session(); return true; },
   async signIn(email) { S.user = { id: 'local', email, since: (S.user && S.user.since) || new Date().toISOString() }; persist(); await this.session(); },
@@ -126,6 +131,9 @@ const local = {
     const b = Object.assign({ id: uid(), owner: 'local', plan: 'starter', paid: false, verified: false, featured: false, photos: [], prices: [], deal: '', paid_until: null, lapsed_plan: '', created_at: new Date().toISOString() }, o);
     const problem = localReview(b);
     b.status = problem ? 'pending' : 'approved'; b.review_note = problem;
+    const pl = localPromo();
+    b.promo = S.biz.some(x => x.owner === b.owner && x.promo) ? '' : pl.free_left > 0 ? 'free' : pl.founding_left > 0 ? 'founding' : '';
+    if (b.promo === 'free') Object.assign(b, { plan: 'premium', paid: true, paid_until: new Date(Date.now() + 30 * DAY).toISOString() });
     S.biz.unshift(b);
     localNote('local', null, 'listing', problem ? 'Listing waiting for you' : 'New listing is live', problem ? b.name + ': ' + problem : b.name, problem ? '#/admin' : '#/b/' + b.id);
     persist(); return b;
@@ -197,12 +205,13 @@ const live = {
   },
   async load() {
     await sb.rpc('housekeeping').then(() => {}, () => {});
-    const [b, r, q, e, c, p, rp, ids] = await Promise.all([
+    const [b, r, q, e, c, pr, p, rp, ids] = await Promise.all([
       sb.from('businesses').select('*').order('created_at', { ascending: false }),
       sb.from('reviews').select('*').order('created_at', { ascending: false }),
       sb.from('requests').select('*').order('created_at', { ascending: false }),
       sb.from('events').select('*').order('created_at', { ascending: true }),
       sb.rpc('public_counts'),
+      sb.rpc('promo_status'),
       ME.user ? sb.from('payments').select('*').order('created_at', { ascending: false }) : Promise.resolve({ data: [] }),
       ME.admin ? sb.from('reports').select('*').order('created_at', { ascending: false }) : Promise.resolve({ data: [] }),
       ME.admin ? sb.from('ideas').select('*').order('created_at', { ascending: false }) : Promise.resolve({ data: [] })
@@ -212,6 +221,7 @@ const live = {
     DB.all = ok(b); DB.reviews = ok(r); DB.requests = ok(q); DB.events = ok(e);
     DB.payments = p.error ? [] : p.data; DB.reports = rp.error ? [] : rp.data;
     DB.counts = {}; (ok(c) || []).forEach(x => { DB.counts[x.business_id] = Number(x.contacts); });
+    DB.promo = !pr.error && pr.data && pr.data[0] ? pr.data[0] : { free_left: 0, founding_left: 0 };
   },
   async signUp(email, pw) { const d = ok(await sb.auth.signUp({ email, password: pw })); await this.session(); return !!(d && d.session); },
   async signIn(email, pw) { ok(await sb.auth.signInWithPassword({ email, password: pw })); await this.session(); },
@@ -296,9 +306,11 @@ function approved() {
   return DB.all.filter(b => b.status === 'approved').sort((a, b) =>
     RANK[a.plan] - RANK[b.plan] || (rating(b) || 0) - (rating(a) || 0) || contacts(b) - contacts(a) || a.name.localeCompare(b.name));
 }
-const payingCount = () => DB.all.filter(b => b.status === 'approved' && b.plan !== 'starter' && b.paid).length;
-const foundingLeft = () => Math.max(0, C.foundingSpots - payingCount());
-const priceNow = plan => foundingLeft() > 0 ? C.plans[plan].founding : C.plans[plan].price;
+const PROMO_SPOTS = 10;
+const freeLeft = () => Number(DB.promo.free_left) || 0;
+const foundingLeft = () => freeLeft() > 0 ? 0 : Number(DB.promo.founding_left) || 0;
+// A business keeps the founding price for as long as it stays. New listings see the price they would get today.
+const priceNow = (plan, b) => (b ? b.promo === 'founding' : foundingLeft() > 0) ? C.plans[plan].founding : C.plans[plan].price;
 const featuredList = () => approved().filter(b => b.featured && b.plan === 'premium').slice(0, C.featuredSlots);
 
 /* ---------------- small pieces ---------------- */
@@ -331,8 +343,15 @@ const head = (title, link, label) => `<div class="sec-head"><h2>${title}</h2>${l
 const catOptions = sel => CATS.map(c => `<option value="${c.id}"${c.id === sel ? ' selected' : ''}>${esc(c.name)}</option>`).join('');
 const field = (label, inner, hint) => `<label class="field"><span class="field-label">${label}</span>${inner}${hint ? `<span class="hint">${hint}</span>` : ''}</label>`;
 const val = (fd, k) => String(fd.get(k) || '').trim();
-const foundingNote = () => foundingLeft() > 0
-  ? `<p class="founding">Founding-member prices are open to the first ${C.foundingSpots} paying businesses. ${plural(foundingLeft(), 'place is', 'places are')} left.</p>` : '';
+const promoDots = left => `<span class="promo-dots" aria-hidden="true">${Array.from({ length: PROMO_SPOTS }, (_, i) => `<i class="${i < PROMO_SPOTS - left ? 'taken' : ''}"></i>`).join('')}</span>`;
+function foundingNote() {
+  const f = freeLeft(), d = foundingLeft();
+  if (f > 0) return `<div class="promo"><p class="promo-title">Launch offer: the first ${PROMO_SPOTS} businesses get Premium free for a month</p>
+    ${promoDots(f)}<p class="promo-left"><strong>${f} of ${PROMO_SPOTS}</strong> free places left. Just list your business and it switches on by itself, no payment and no code needed.</p></div>`;
+  if (d > 0) return `<div class="promo"><p class="promo-title">Founding price for the next ${PROMO_SPOTS} businesses: Premium $${C.plans.premium.founding} instead of $${C.plans.premium.price}</p>
+    ${promoDots(d)}<p class="promo-left"><strong>${d} of ${PROMO_SPOTS}</strong> founding places left. Growth is $${C.plans.growth.founding} instead of $${C.plans.growth.price}, and you keep the lower price for as long as you stay.</p></div>`;
+  return '';
+}
 
 /* ---------------- pages ---------------- */
 function home() {
@@ -560,11 +579,11 @@ function dealsPage() {
 }
 
 function planCards(mode, selected) {
-  const fl = foundingLeft() > 0;
+  const fl = foundingLeft() > 0, free = freeLeft() > 0;
   return ['premium', 'growth', 'starter'].map(id => {
     const p = C.plans[id], price = priceNow(id);
     const priceHtml = p.price === 0 ? '<span class="price-n">Free</span>'
-      : `<span class="price-n">$${price}</span><span class="price-per">a month</span>${fl ? `<span class="price-was">$${p.price} after founding places fill</span>` : ''}`;
+      : `<span class="price-n">$${price}</span><span class="price-per">a month</span>${fl ? `<span class="price-was">Founding price. Usually $${p.price}</span>` : ''}${free && id === 'premium' ? '<span class="price-was">First month free for the first 10 businesses</span>' : ''}`;
     const body = `
       ${id === 'growth' ? '<span class="pop">Most popular</span>' : ''}
       <span class="plan-name">${p.name}</span>
@@ -600,12 +619,15 @@ function join(parts, params) {
   const d = J.d;
   const steps = `<ol class="steps">${['Your business', 'How to reach you', 'Choose a plan'].map((s, i) => `<li class="${J.step === i + 1 ? 'on' : J.step > i + 1 ? 'done' : ''}">${s}</li>`).join('')}</ol>`;
   if (J.step === 4) {
-    const live = J.status === 'approved', paidPick = J.plan !== 'starter';
+    const nb = byId(J.id) || {}, gotFree = nb.promo === 'free', gotFounding = nb.promo === 'founding';
+    const live = J.status === 'approved', paidPick = J.plan !== 'starter' && !gotFree;
     const msg = `Hi, I have just listed "${J.d.name}" on ${C.siteName}.`;
     const html = `<div class="wrap page narrow"><div class="done-box">
       <h1>${live ? `${esc(J.d.name)} is live.` : 'Sent for approval.'}</h1>
       <p>${live ? 'Neighbours can find it in the directory now. Add photos and prices so it stands out.' : `${esc(J.d.name)} will appear in the directory as soon as the admin has checked it, usually within a day.`}</p>
-      ${paidPick ? `<p>You chose ${C.plans[J.plan].name} at $${priceNow(J.plan)} a month. To switch it on, pay ${C.paymentNote ? esc(C.paymentNote.replace(/\.$/, '')) : 'the admin by EcoCash'}, then enter the transaction reference in your dashboard. It runs for ${PLAN_DAYS} days from when it is confirmed.</p>` : ''}
+      ${gotFree ? `<p class="notice"><strong>You got one of the ${PROMO_SPOTS} free places.</strong> Premium is on for free until ${fmtDate(nb.paid_until)}. Add up to ${C.plans.premium.photos} photos in your dashboard.</p>` : ''}
+      ${gotFounding ? `<p class="notice"><strong>You got a founding place.</strong> You pay $${C.plans.premium.founding} instead of $${C.plans.premium.price} for Premium, or $${C.plans.growth.founding} instead of $${C.plans.growth.price} for Growth, for as long as you stay.</p>` : ''}
+      ${paidPick ? `<p>You chose ${C.plans[J.plan].name} at $${priceNow(J.plan, nb)} a month. To switch it on, pay ${C.paymentNote ? esc(C.paymentNote.replace(/\.$/, '')) : 'the admin by EcoCash'}, then enter the transaction reference in your dashboard. It runs for ${PLAN_DAYS} days from when it is confirmed.</p>` : ''}
       <p>${paidPick ? `<a class="btn btn-brass" href="#/dashboard?id=${esc(J.id)}&pay=${J.plan}">Enter my payment reference</a> ` : ''}<a class="btn btn-green" href="#/dashboard?id=${esc(J.id)}">Add photos and prices</a>
       ${!live && C.adminWhatsApp ? ` <a class="btn btn-wa" href="${waLink(C.adminWhatsApp, msg)}" target="_blank" rel="noopener">Tell the admin on WhatsApp</a>` : ''}</p>
     </div></div>`;
@@ -655,8 +677,7 @@ function account(parts, params) {
     const opt = (v, label) => `<label class="seg-opt"><input type="radio" name="theme" value="${v}" data-change="theme"${pref === v ? ' checked' : ''}><span>${label}</span></label>`;
     const installRow = standalone() ? '<p class="muted">Vazuva is on your home screen.</p>'
       : installEvt ? '<p><button class="btn btn-line" type="button" data-act="install">Add to home screen</button></p>'
-      : isIOS() ? '<p class="muted">In Safari, tap the Share button, then <em>Add to Home Screen</em>.</p>'
-      : '<p class="muted">Open the menu in your browser and choose <em>Add to home screen</em> or <em>Install app</em>.</p>';
+      : '<p><a class="btn btn-line" href="#/install">Show me how, step by step</a></p>';
     return `<div class="wrap page narrow acct">
       <section class="acct-head">
         <span class="avatar" aria-hidden="true">${esc(initials)}</span>
@@ -750,17 +771,17 @@ async function dashboard(parts, params) {
   const howToPay = C.paymentNote ? esc(C.paymentNote.replace(/\.$/, '')) : 'the admin by EcoCash';
   const payForm = waiting ? '' : `<section id="pay"><details class="pay"${payOpen ? ' open' : ''}><summary>${paid ? 'Pay for your next month' : 'Upgrade your plan'}</summary>
       <form data-form="pay" data-id="${esc(b.id)}" class="card-form">
-        ${field('Plan', `<select name="plan" data-change="pay-plan">${['growth', 'premium'].map(x => `<option value="${x}"${x === pickPlan ? ' selected' : ''}>${C.plans[x].name}, $${priceNow(x)} a month</option>`).join('')}</select>`)}
+        ${field('Plan', `<select name="plan" data-change="pay-plan">${['growth', 'premium'].map(x => `<option value="${x}"${x === pickPlan ? ' selected' : ''}>${C.plans[x].name}, $${priceNow(x, b)} a month</option>`).join('')}</select>`)}
         <p>Pay ${howToPay}. Then enter the details below and the admin will switch your plan on for ${PLAN_DAYS} days.</p>
         <div class="two">
           ${field('EcoCash transaction reference', '<input name="reference" required minlength="3" maxlength="60" autocomplete="off" placeholder="e.g. MP231118.1200.A12345">', 'It is in the SMS EcoCash sends you. Paid in cash? Type CASH.')}
-          ${field('Amount paid ($)', `<input name="amount" type="number" min="0" max="999" step="0.01" required value="${priceNow(pickPlan)}">`)}
+          ${field('Amount paid ($)', `<input name="amount" type="number" min="0" max="999" step="0.01" required value="${priceNow(pickPlan, b)}">`)}
         </div>
         <button class="btn btn-brass" type="submit">Send payment details</button>
       </form></details></section>`;
   const planNote = waiting
     ? `<p class="notice">Payment details sent: $${esc(waiting.amount)} for ${C.plans[waiting.plan].name}, reference <span class="ref">${esc(waiting.reference)}</span>. The admin will confirm it, usually the same day, and your plan switches on straight away.</p>`
-    : ending ? `<p class="notice notice-warn">Your ${p.name} plan ${left <= 0 ? 'ends today' : `ends in ${plural(left, 'day', 'days')}`}, on ${fmtDate(b.paid_until)}. Pay $${priceNow(b.plan)} below to keep your place in search${b.plan === 'premium' ? ', your video and your feature slot' : ', your deals and your reviews'}.</p>`
+    : ending ? `<p class="notice notice-warn">Your ${p.name} plan ${left <= 0 ? 'ends today' : `ends in ${plural(left, 'day', 'days')}`}, on ${fmtDate(b.paid_until)}. Pay $${priceNow(b.plan, b)} below to keep your place in search${b.plan === 'premium' ? ', your video and your feature slot' : ', your deals and your reviews'}.</p>`
     : !paid && b.lapsed_plan ? `<p class="notice notice-warn">Your ${C.plans[b.lapsed_plan].name} plan ended${b.paid_until ? ` on ${fmtDate(b.paid_until)}` : ''}, so your listing is back on Starter. Pay below to switch it back on.</p>`
     : turnedDown ? `<p class="notice notice-warn">The admin could not find payment reference <span class="ref">${esc(turnedDown.reference)}</span>. Check the reference in your EcoCash SMS and send it again${C.adminWhatsApp ? `, or <a href="${waLink(C.adminWhatsApp, `Hi, about my payment for ${b.name} on ${C.siteName}, reference ${turnedDown.reference}.`)}" target="_blank" rel="noopener">message the admin</a>` : ''}.</p>`
     : '';
@@ -782,9 +803,9 @@ async function dashboard(parts, params) {
       <div class="bars">${st.wa.map((n, i) => `<div class="bar"><span class="bar-n">${n}</span><span class="bar-fill" style="height:${Math.round(n / max * 100)}%"></span><span class="bar-l">${labels[i]}</span></div>`).join('')}</div></section>`
       : `<section class="upsell"><h2>${st.view[3]} ${st.view[3] === 1 ? 'neighbour' : 'neighbours'} looked at your listing this week.</h2>
           <p>How many tapped WhatsApp? On Starter you cannot see that, and paid listings sit above yours in every search. Growth shows you clicks week by week, lets you post deals, collect reviews and link your Instagram, Facebook and TikTok.</p>
-          <p><a class="btn btn-brass" href="#/dashboard?id=${esc(b.id)}&pay=growth">Upgrade to Growth, $${priceNow('growth')} a month</a></p></section>`}
+          <p><a class="btn btn-brass" href="#/dashboard?id=${esc(b.id)}&pay=growth">Upgrade to Growth, $${priceNow('growth', b)} a month</a></p></section>`}
     ${b.plan === 'growth' && pos > 1 ? `<section class="upsell"><h2>You are number ${pos} in ${esc(catName(b.cat))}.</h2><p>Premium listings always show first, and get a homepage feature slot, a business video and the Verified resident badge.</p>
-      <p><a class="btn btn-brass" href="#/dashboard?id=${esc(b.id)}&pay=premium">Upgrade to Premium, $${priceNow('premium')} a month</a></p></section>` : ''}
+      <p><a class="btn btn-brass" href="#/dashboard?id=${esc(b.id)}&pay=premium">Upgrade to Premium, $${priceNow('premium', b)} a month</a></p></section>` : ''}
     ${payForm}
 
     <section><h2>Bring your own customers</h2>
@@ -827,7 +848,7 @@ function admin() {
   const claims = DB.payments.filter(x => x.status === 'pending');
   const soon = DB.all.filter(b => b.plan !== 'starter' && b.paid_until && daysLeft(b) <= REMIND_DAYS).sort((a, b) => a.paid_until < b.paid_until ? -1 : 1);
   const ended = DB.all.filter(b => b.plan === 'starter' && b.lapsed_plan && b.status === 'approved');
-  const remind = (b, plan, endedNow) => b.wa ? `<a class="btn btn-wa btn-small" href="${waLink(b.wa, `Hi ${b.owner_name || b.name}, your ${C.plans[plan].name} plan for ${b.name} on ${C.siteName} ${endedNow ? 'ended' : 'ends'}${b.paid_until ? ` on ${fmtDate(b.paid_until)}` : ''}. To ${endedNow ? 'switch it back on' : 'keep it'}, pay $${priceNow(plan)}${C.paymentNote ? ` (${C.paymentNote.replace(/\.$/, '')})` : ' by EcoCash'} and enter the payment reference in your dashboard: ${siteUrl()}#/dashboard?id=${b.id}&pay=${plan}`)}" target="_blank" rel="noopener">Send reminder</a>` : '<span class="muted">No WhatsApp number</span>';
+  const remind = (b, plan, endedNow) => b.wa ? `<a class="btn btn-wa btn-small" href="${waLink(b.wa, `Hi ${b.owner_name || b.name}, your ${C.plans[plan].name} plan for ${b.name} on ${C.siteName} ${endedNow ? 'ended' : 'ends'}${b.paid_until ? ` on ${fmtDate(b.paid_until)}` : ''}. To ${endedNow ? 'switch it back on' : 'keep it'}, pay $${priceNow(plan, b)}${C.paymentNote ? ` (${C.paymentNote.replace(/\.$/, '')})` : ' by EcoCash'} and enter the payment reference in your dashboard: ${siteUrl()}#/dashboard?id=${b.id}&pay=${plan}`)}" target="_blank" rel="noopener">Send reminder</a>` : '<span class="muted">No WhatsApp number</span>';
   const reasons = b => DB.reports.filter(r => r.business_id === b.id).map(r => esc(r.reason));
   const paidCell = b => b.plan === 'starter' ? '<span class="muted">Free</span>'
     : !b.paid ? '<span class="muted">Not paid</span>'
@@ -994,7 +1015,7 @@ function pushCard(context) {
   const st = pushState();
   const why = context === 'request' ? 'Get a pop-up on this phone the moment a business offers to help.' : 'Get a pop-up on this phone, even when Vazuva is closed.';
   const msg = { on: 'Pop-ups are on for this phone.', blocked: 'Pop-ups are blocked for this site. Allow notifications for vazuva.com in your browser settings to turn them on.',
-    ios: 'On iPhone, add Vazuva to your home screen first (in Safari, tap Share, then Add to Home Screen), then open it from there to turn on pop-ups.',
+    ios: 'On iPhone, pop-ups only work once Vazuva is on your home screen. <a href="#/install?on=iphone">Show me how, step by step</a>.',
     unsupported: 'This browser cannot show pop-ups. The bell on the site still works.', off: why }[st];
   const btn = st === 'on' ? '<button type="button" class="btn btn-line btn-small" data-act="push-off">Turn off</button>'
     : st === 'off' ? '<button type="button" class="btn btn-green btn-small" data-act="push-on">Turn on pop-ups</button>' : '';
@@ -1056,7 +1077,7 @@ function fillInstall() {
   if (standalone() || ls.get('mm_install_hidden')) { slot.innerHTML = ''; return; }
   const close = '<button type="button" class="link install-x" data-act="install-hide" aria-label="Hide this">Not now</button>';
   if (installEvt) slot.innerHTML = `<div class="install"><div><strong>Get ${esc(C.siteName)} on your phone</strong><p>One tap from your home screen, like any other app. Free, and no app store needed.</p></div><p class="install-acts"><button class="btn btn-green" type="button" data-act="install">Add to home screen</button>${close}</p></div>`;
-  else if (isIOS()) slot.innerHTML = `<div class="install"><div><strong>Get ${esc(C.siteName)} on your iPhone</strong><p>In Safari, tap the Share button <span aria-hidden="true">(the square with an arrow)</span>, then <em>Add to Home Screen</em>.</p></div><p class="install-acts">${close}</p></div>`;
+  else if (isIOS() || /android/i.test(navigator.userAgent)) slot.innerHTML = `<div class="install"><div><strong>Get ${esc(C.siteName)} on your phone</strong><p>One tap from your home screen, like any other app. Free, and no app store needed.</p></div><p class="install-acts"><a class="btn btn-green" href="#/install">Show me how</a>${close}</p></div>`;
   else slot.innerHTML = '';
 }
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); installEvt = e; fillInstall(); });
@@ -1065,10 +1086,52 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
   window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
 }
 
+
+/* ---- "add to your phone" guide, written for people new to smartphones ---- */
+const ICON = {
+  share: '<svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3M8 7l4-4 4 4"/><path d="M8 10H6a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-9a1 1 0 0 0-1-1h-2"/></svg>',
+  add: '<svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="4" y="4" width="16" height="16" rx="4"/><path d="M12 8v8M8 12h8"/></svg>',
+  dots: '<svg viewBox="0 0 24 24" width="30" height="30" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>',
+  vdots: '<svg viewBox="0 0 24 24" width="30" height="30" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>',
+  compass: '<svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M15.5 8.5l-2 5-5 2 2-5z" fill="currentColor"/></svg>',
+  bell: '<svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 16v-5a6 6 0 0 0-12 0v5l-2 2h16zM10 21h4"/></svg>'
+};
+const gStep = (icon, title, text) => `<li class="g-step">${icon ? `<span class="g-icon" aria-hidden="true">${icon}</span>` : '<span class="g-icon g-blank" aria-hidden="true"></span>'}<div><h3>${title}</h3><p>${text}</p></div></li>`;
+function installPage(parts, params) {
+  const which = params.get('on') || (isIOS() ? 'iphone' : 'android');
+  const tab = (id, label) => `<a class="g-tab${which === id ? ' on' : ''}" href="#/install?on=${id}">${label}</a>`;
+  const done = standalone() ? `<p class="notice"><strong>${esc(C.siteName)} is already on this phone.</strong> You are using it right now.</p>` : '';
+  const iphone = `<ol class="guide">
+      ${gStep(ICON.compass, 'Open the link in Safari', `Safari is the blue compass app. If you tapped the link inside WhatsApp, look at the bottom of the screen and tap the small compass ${ICON.compass.replace('width="30" height="30"', 'width="18" height="18" class="inl"')} to open it in Safari.`)}
+      ${gStep(ICON.share, 'Tap the Share button', `It is a square with an arrow pointing up, at the bottom of the screen. Can't see it? Tap the three dots ${ICON.dots.replace('width="30" height="30"', 'width="18" height="18" class="inl"')} first, then tap <strong>Share</strong>.`)}
+      ${gStep(ICON.add, 'Tap "Add to Home Screen"', 'A list opens. Move your finger up the screen to scroll down the list until you see <strong>Add to Home Screen</strong>, then tap it. If you see a switch called <strong>Open as Web App</strong>, leave it on (green).')}
+      ${gStep('', 'Tap "Add"', 'It is at the top right of the screen.')}
+      ${gStep(`<img src="icon-192.png" alt="" width="30" height="30" style="border-radius:7px">`, `Open ${esc(C.siteName)} from your home screen`, `Close Safari. You will now see the ${esc(C.siteName)} icon with your other apps. From now on, always open ${esc(C.siteName)} by tapping that icon.`)}
+      ${gStep(ICON.bell, 'Turn on notifications (optional)', `Inside the app, tap the bell at the top, then <strong>Turn on pop-ups</strong>, then <strong>Allow</strong>. Your phone will tell you when someone needs your service.`)}
+    </ol>`;
+  const android = `<ol class="guide">
+      ${gStep(ICON.compass, 'Open the link in Chrome', `If you tapped the link inside WhatsApp, tap the three dots ${ICON.vdots.replace('width="30" height="30"', 'width="18" height="18" class="inl"')} at the top right, then <strong>Open in Chrome</strong>.`)}
+      ${installEvt ? gStep(ICON.add, 'Or just tap this button', '<button class="btn btn-green" type="button" data-act="install">Add to my home screen</button>') : ''}
+      ${gStep(ICON.vdots, 'Tap the three dots', 'They are at the top right of Chrome.')}
+      ${gStep(ICON.add, 'Tap "Add to Home screen" or "Install app"', 'You may need to scroll down the menu a little. Then tap <strong>Install</strong> or <strong>Add</strong>.')}
+      ${gStep(`<img src="icon-192.png" alt="" width="30" height="30" style="border-radius:7px">`, `Open ${esc(C.siteName)} from your home screen`, `You will now see the ${esc(C.siteName)} icon with your other apps. Tap it any time to open ${esc(C.siteName)}.`)}
+      ${gStep(ICON.bell, 'Turn on notifications (optional)', 'Inside the app, tap the bell at the top, then <strong>Turn on pop-ups</strong>, then <strong>Allow</strong>.')}
+    </ol>`;
+  const share = 'https://wa.me/?text=' + encodeURIComponent(`How to put ${C.siteName} on your phone, step by step: ${siteUrl()}#/install`);
+  return `<div class="wrap page narrow guide-page">
+    <h1>Put ${esc(C.siteName)} on your phone</h1>
+    <p class="lead">It takes one minute, it is free, and you do not need the app store. Follow the steps one at a time.</p>
+    ${done}
+    <div class="g-tabs">${tab('iphone', 'iPhone')}${tab('android', 'Android (Samsung, Tecno, Itel and others)')}</div>
+    ${which === 'iphone' ? iphone : android}
+    <p class="muted">Stuck? Ask someone to help you with this page, or <a href="${share}" target="_blank" rel="noopener">send these steps to someone on WhatsApp</a>.</p>
+  </div>`;
+}
+
 const notFound = () => `<div class="wrap page narrow"><h1>That page is not here.</h1><p><a class="btn btn-green" href="#/">Back to the directory</a></p></div>`;
 
 /* ---------------- router ---------------- */
-const routes = { '': home, browse, b: profile, requests: requestsPage, deals: dealsPage, pricing, join, account, dashboard, admin, forgot, reset: resetPage, suggest: suggestPage, ideas: suggestPage, notifications: notificationsPage };
+const routes = { '': home, browse, b: profile, requests: requestsPage, deals: dealsPage, pricing, join, account, dashboard, admin, forgot, reset: resetPage, suggest: suggestPage, ideas: suggestPage, notifications: notificationsPage, install: installPage };
 async function render(keepScroll) {
   const h = location.hash.replace(/^#\/?/, ''), cut = h.indexOf('?');
   const path = cut < 0 ? h : h.slice(0, cut), params = new URLSearchParams(cut < 0 ? '' : h.slice(cut + 1));
@@ -1240,7 +1303,7 @@ const acts = {
 const changes = {
   theme(t) { try { localStorage.setItem('mm_theme', t.value); } catch (e) { /* storage blocked */ } applyTheme(); },
   async 'idea-status'(t) { await api.setIdeaStatus(t.dataset.id, t.value); toast('Status updated.'); await refresh(); },
-  'pay-plan'(t) { const a = t.form.querySelector('[name=amount]'); if (a) a.value = priceNow(t.value); },
+  'pay-plan'(t) { const a = t.form.querySelector('[name=amount]'); if (a) a.value = priceNow(t.value, byId(t.form.dataset.id)); },
   async 'adm-plan'(t) {
     const p = { plan: t.value }; if (t.value !== 'premium') p.featured = false; if (t.value === 'starter') Object.assign(p, { paid: false, paid_until: null, lapsed_plan: '' });
     await api.updateBiz(t.dataset.id, p); toast('Plan changed.'); await refresh();
