@@ -34,7 +34,7 @@ const ago = iso => {
   if (d < 60) return Math.floor(d / 7) + ' weeks ago'; return Math.floor(d / 30) + ' months ago';
 };
 
-let DB = { all: [], reviews: [], requests: [], events: [], counts: {}, payments: [], reports: [], ideas: [], notes: [], promo: { free_left: 0, founding_left: 0 } };
+let DB = { all: [], reviews: [], requests: [], events: [], counts: {}, payments: [], reports: [], ideas: [], notes: [], promo: { free_left: 0, founding_left: 0 }, loading: false };
 const PLAN_DAYS = 30, REMIND_DAYS = 5;
 const fmtDate = iso => new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
 const daysLeft = b => b.paid_until ? Math.ceil((new Date(b.paid_until).getTime() - Date.now()) / DAY) : null;
@@ -204,7 +204,7 @@ const live = {
     if (u) { const r = await sb.rpc('is_admin'); ME.admin = !r.error && r.data === true; }
   },
   async load() {
-    await sb.rpc('housekeeping').then(() => {}, () => {});
+    sb.rpc('housekeeping').then(() => {}, () => {});   // runs in the background, never holds up the page
     const [b, r, q, e, c, pr, p, rp, ids] = await Promise.all([
       sb.from('businesses').select('*').order('created_at', { ascending: false }),
       sb.from('reviews').select('*').order('created_at', { ascending: false }),
@@ -416,7 +416,8 @@ function home() {
         </a>`).join('')}</div>
     </section>` : ''}
 
-    ${!list.length ? `<section class="sec empty">
+    ${!list.length && DB.loading ? `<section class="sec empty"><p class="loading-dots">Finding your neighbours…</p></section>` : ''}
+    ${!list.length && !DB.loading ? `<section class="sec empty">
       <h2>The directory opens with its first listing.</h2>
       <p>Run a business in Mabvazuva? Be the name everyone sees first.</p>
       <a class="btn btn-green" href="#/join">List your business free</a>
@@ -1393,13 +1394,21 @@ window.addEventListener('hashchange', () => render());
       S = ls.get(PKEY) || seed(); persist();
       $('#ribbon').innerHTML = `<div class="ribbon"><span>Preview mode: sample businesses, saved on this device only. Connect the database to go live.</span> <button type="button" data-act="preview-reset">Reset preview</button></div>`;
     }
-    await api.session(); await api.load();
     const clean = h => history.replaceState(null, '', location.pathname + location.search + h);
     if (RECOVERY) clean('#/reset');
     else if (LINK_ERROR) clean('#/forgot?expired=1');
-    if (ME.user) pushResync(false);
-  } catch (e) { toast(nice(e)); }
-  render();
+    if (LIVE) {
+      await api.session();           // quick, mostly local: gets the shell and menu right
+      render();                      // show the page now, before the slow part
+      DB.loading = true;
+      await api.load();              // the slow part: fetch businesses etc.
+      DB.loading = false;
+      if (ME.user) pushResync(false);
+      render(true);                  // fill in the real data
+    } else {
+      await api.session(); await api.load(); render();
+    }
+  } catch (e) { DB.loading = false; toast(nice(e)); render(); }
 })();
 
 })();
