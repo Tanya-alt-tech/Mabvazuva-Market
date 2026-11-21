@@ -311,7 +311,18 @@ const freeLeft = () => Number(DB.promo.free_left) || 0;
 const foundingLeft = () => freeLeft() > 0 ? 0 : Number(DB.promo.founding_left) || 0;
 // A business keeps the founding price for as long as it stays. New listings see the price they would get today.
 const priceNow = (plan, b) => (b ? b.promo === 'founding' : foundingLeft() > 0) ? C.plans[plan].founding : C.plans[plan].price;
-const featuredList = () => approved().filter(b => b.featured && b.plan === 'premium').slice(0, C.featuredSlots);
+const FEAT_PERIOD = 6 * 3600 * 1000;   // the rotating set changes every 6 hours
+function featuredList() {
+  const prem = approved().filter(b => b.plan === 'premium');
+  const slots = C.featuredSlots;
+  if (prem.length <= slots) return prem;                 // everyone fits, no need to rotate
+  const pinned = prem.filter(b => b.featured).slice(0, slots);   // admin can pin a few to always show
+  const pool = prem.filter(b => !pinned.includes(b));
+  const need = slots - pinned.length, out = pinned.slice();
+  const off = pool.length ? Math.floor(Date.now() / FEAT_PERIOD) % pool.length : 0;
+  for (let i = 0; i < need && i < pool.length; i++) out.push(pool[(off + i) % pool.length]);
+  return out;
+}
 
 /* ---------------- small pieces ---------------- */
 let toastTimer;
@@ -320,9 +331,12 @@ function toast(msg) {
   clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), Math.max(4200, msg.length * 90));
 }
 const mono = name => name.replace(/[^A-Za-z0-9 ]/g, '').split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0].toUpperCase()).join('');
-const plaque = (b, cls) => b.photos && b.photos.length
-  ? `<span class="plaque ${cls || ''}"><img src="${esc(b.photos[0])}" alt="" loading="lazy"></span>`
-  : `<span class="plaque ${cls || ''}" aria-hidden="true">${esc(mono(b.name))}</span>`;
+const plaque = (b, cls) => {
+  const ph = b.photos || [];
+  if (!ph.length) return `<span class="plaque ${cls || ''}" aria-hidden="true">${esc(mono(b.name))}</span>`;
+  if (ph.length === 1) return `<span class="plaque ${cls || ''}"><img src="${esc(ph[0])}" alt="" loading="lazy"></span>`;
+  return `<span class="plaque ${cls || ''} rot" data-rot>${ph.map((u, i) => `<img src="${esc(u)}" alt="" loading="lazy" class="${i ? '' : 'on'}">`).join('')}</span>`;
+};
 const tick = b => b.verified ? '<span class="tick" title="Verified Mabvazuva resident">Verified resident</span>' : '';
 const starText = b => { const r = rating(b); return r ? `<span class="stars">★ ${r.toFixed(1)}</span> from ${plural(reviewsOf(b).length, 'review', 'reviews')}` : ''; };
 function metaLine(b) {
@@ -497,7 +511,9 @@ function profile(parts) {
   </section>
   <div class="wrap page pro">
     ${b.status !== 'approved' ? `<p class="notice">This listing is ${b.status === 'pending' ? 'waiting for approval' : 'not approved'}. Only you can see it.</p>` : ''}
-    ${b.photos && b.photos.length ? `<div class="gallery">${b.photos.map(p => `<img src="${esc(p)}" alt="Photo from ${esc(b.name)}" loading="lazy">`).join('')}</div>` : ''}
+    ${b.photos && b.photos.length ? (b.photos.length > 1
+      ? `<div class="shots" data-rot>${b.photos.map((u, i) => `<img src="${esc(u)}" alt="Photo from ${esc(b.name)}" loading="lazy" class="${i ? '' : 'on'}">`).join('')}<span class="shots-dots">${b.photos.map((_, i) => `<i class="${i ? '' : 'on'}"></i>`).join('')}</span></div>`
+      : `<div class="gallery"><img src="${esc(b.photos[0])}" alt="Photo from ${esc(b.name)}" loading="lazy"></div>`) : ''}
     ${b.plan === 'premium' && ytId(b.video) ? `<div class="video${/shorts\//.test(b.video) ? ' video-tall' : ''}"><iframe src="https://www.youtube-nocookie.com/embed/${ytId(b.video)}" title="Video from ${esc(b.name)}" loading="lazy" allow="encrypted-media; picture-in-picture" allowfullscreen></iframe></div>` : ''}
     ${b.deal && b.plan !== 'starter' ? `<div class="deal deal-wide"><span class="deal-text">${esc(b.deal)}</span><span class="deal-by">Current deal</span></div>` : ''}
     <div class="pro-grid">
@@ -597,13 +613,12 @@ function planCards(mode, selected) {
 }
 
 function pricing() {
-  const taken = featuredList().length;
   return `<div class="wrap page">
     <h1>Put your business in front of every household in Mabvazuva.</h1>
     <p class="lead">Start free. Move up when the enquiries come in. No contracts, cancel any month.</p>
     ${foundingNote()}
     <div class="plans">${planCards('show')}</div>
-    <p class="muted">${C.featuredSlots - taken} of ${C.featuredSlots} homepage feature slots are open. Pay monthly by EcoCash, bank transfer or cash. Every listing is checked by the admin before it goes live.</p>
+    <p class="muted">Premium businesses take turns in the featured spots on the homepage, so everyone gets a turn. Pay monthly by EcoCash, bank transfer or cash. Every listing is checked by the admin before it goes live.</p>
     <div class="faq">
       <details><summary>Do I need a registered company?</summary><p>No. If you offer a service in or for Mabvazuva, you can list it: lessons, baking, repairs, anything.</p></details>
       <details><summary>How do customers reach me?</summary><p>Every listing has one WhatsApp button that opens a chat with you. No middleman and no commission.</p></details>
@@ -718,7 +733,7 @@ function account(parts, params) {
       <section class="acct-card">
         <h2>Help</h2>
         <p class="muted">Questions about your listing, a payment or anything else.</p>
-        <p>${C.adminWhatsApp ? `<a class="btn btn-wa" href="${waLink(C.adminWhatsApp, `Hi, I need help with my ${C.siteName} account (${email}).`)}" target="_blank" rel="noopener">Message the admin</a> ` : ''}<a class="btn btn-line" href="#/pricing">Plans and prices</a> <a class="btn btn-line" href="#/suggest">Suggest an improvement</a></p>
+        <div class="help-acts">${C.adminWhatsApp ? `<a class="btn btn-wa" href="${waLink(C.adminWhatsApp, `Hi, I need help with my ${C.siteName} account (${email}).`)}" target="_blank" rel="noopener">Message the admin</a>` : ''}<a class="btn btn-line" href="#/pricing">Plans and prices</a><a class="btn btn-line" href="#/suggest">Suggest an improvement</a></div>
       </section>
 
       <p class="acct-out"><button class="btn btn-line" type="button" data-act="signout">Sign out</button></p>
@@ -804,7 +819,7 @@ async function dashboard(parts, params) {
       : `<section class="upsell"><h2>${st.view[3]} ${st.view[3] === 1 ? 'neighbour' : 'neighbours'} looked at your listing this week.</h2>
           <p>How many tapped WhatsApp? On Starter you cannot see that, and paid listings sit above yours in every search. Growth shows you clicks week by week, lets you post deals, collect reviews and link your Instagram, Facebook and TikTok.</p>
           <p><a class="btn btn-brass" href="#/dashboard?id=${esc(b.id)}&pay=growth">Upgrade to Growth, $${priceNow('growth', b)} a month</a></p></section>`}
-    ${b.plan === 'growth' && pos > 1 ? `<section class="upsell"><h2>You are number ${pos} in ${esc(catName(b.cat))}.</h2><p>Premium listings always show first, and get a homepage feature slot, a business video and the Verified resident badge.</p>
+    ${b.plan === 'growth' && pos > 1 ? `<section class="upsell"><h2>You are number ${pos} in ${esc(catName(b.cat))}.</h2><p>Premium listings always show first, take turns in the homepage featured spots, and get a business video and the Verified resident badge.</p>
       <p><a class="btn btn-brass" href="#/dashboard?id=${esc(b.id)}&pay=premium">Upgrade to Premium, $${priceNow('premium', b)} a month</a></p></section>` : ''}
     ${payForm}
 
@@ -860,7 +875,7 @@ function admin() {
       <div class="stat"><span class="stat-n">${DB.all.filter(b => b.status === 'approved').length}</span><span class="stat-l">live listings</span></div>
       <div class="stat"><span class="stat-n">${payers.length}</span><span class="stat-l">paying businesses</span></div>
       <div class="stat"><span class="stat-n">$${revenue}</span><span class="stat-l">a month at full list prices</span></div>
-      <div class="stat"><span class="stat-n">${featN}<small> of ${C.featuredSlots}</small></span><span class="stat-l">feature slots used</span></div>
+      <div class="stat"><span class="stat-n">${featN}</span><span class="stat-l">pinned to featured</span></div>
     </section>
 
     <section><h2>Payments to check</h2>
@@ -890,13 +905,13 @@ function admin() {
 
     <section><h2>All businesses</h2>
       <div class="table-scroll"><table class="adm">
-        <thead><tr><th>Business</th><th>Plan</th><th>Paid until</th><th>Verified</th><th>Featured</th><th></th></tr></thead>
+        <thead><tr><th>Business</th><th>Plan</th><th>Paid until</th><th>Verified</th><th>Pin to featured</th><th></th></tr></thead>
         <tbody>${rest.map(b => `<tr>
           <td><a href="#/b/${esc(b.id)}">${esc(b.name)}</a>${b.status === 'rejected' ? ' <span class="muted">(rejected)</span>' : ''}${reasons(b).length ? `<br><span class="muted">${plural(reasons(b).length, 'report', 'reports')}</span>` : ''}</td>
           <td><select data-change="adm-plan" data-id="${esc(b.id)}" aria-label="Plan for ${esc(b.name)}">${['starter', 'growth', 'premium'].map(x => `<option value="${x}"${x === b.plan ? ' selected' : ''}>${C.plans[x].name}</option>`).join('')}</select></td>
           <td>${paidCell(b)}${b.plan !== 'starter' ? `<br><button type="button" class="link" data-act="adm-extend" data-id="${esc(b.id)}">+1 month</button>` : ''}</td>
           <td>${tog(b, 'verified', 'Verified', 'No')}</td>
-          <td>${b.plan === 'premium' ? tog(b, 'featured', 'Featured', 'No') : '<span class="muted">Premium only</span>'}</td>
+          <td>${b.plan === 'premium' ? tog(b, 'featured', 'Pinned', 'Auto') : '<span class="muted">Premium only</span>'}</td>
           <td class="adm-acts"><a href="#/dashboard?id=${esc(b.id)}">Edit</a> ${b.status === 'rejected' ? `<button type="button" class="link" data-act="adm-status" data-id="${esc(b.id)}" data-v="approved">Approve</button>` : ''} <button type="button" class="link danger" data-act="adm-delete" data-id="${esc(b.id)}">Delete</button></td>
         </tr>`).join('')}</tbody></table></div>
       ${rest.length ? '' : '<p class="muted">No businesses yet.</p>'}</section>
@@ -1132,6 +1147,20 @@ const notFound = () => `<div class="wrap page narrow"><h1>That page is not here.
 
 /* ---------------- router ---------------- */
 const routes = { '': home, browse, b: profile, requests: requestsPage, deals: dealsPage, pricing, join, account, dashboard, admin, forgot, reset: resetPage, suggest: suggestPage, ideas: suggestPage, notifications: notificationsPage, install: installPage };
+let rotTimer;
+function startRotators() {
+  clearInterval(rotTimer);
+  if (!document.querySelector('[data-rot]')) return;
+  rotTimer = setInterval(() => {
+    document.querySelectorAll('[data-rot]').forEach(el => {
+      const imgs = el.querySelectorAll('img'); if (imgs.length < 2) return;
+      let i = 0; imgs.forEach((x, n) => { if (x.classList.contains('on')) i = n; });
+      imgs[i].classList.remove('on'); imgs[(i + 1) % imgs.length].classList.add('on');
+      const dots = el.querySelectorAll('.shots-dots i');
+      if (dots.length) { dots.forEach(d => d.classList.remove('on')); dots[(i + 1) % dots.length].classList.add('on'); }
+    });
+  }, 3200);
+}
 async function render(keepScroll) {
   const h = location.hash.replace(/^#\/?/, ''), cut = h.indexOf('?');
   const path = cut < 0 ? h : h.slice(0, cut), params = new URLSearchParams(cut < 0 ? '' : h.slice(cut + 1));
@@ -1145,6 +1174,7 @@ async function render(keepScroll) {
   $('#foot-admin').hidden = !ME.admin;
   document.body.classList.toggle('has-sticky', !!$('.sticky-wa'));
   fillInstall();
+  startRotators();
   document.title = ($('#app h1') ? $('#app h1').textContent + ' | ' : '') + C.siteName;
   if (!keepScroll) window.scrollTo(0, 0);
   if (params.get('pay') && $('#pay') && $('#pay').scrollIntoView) $('#pay').scrollIntoView({ block: 'start' });
@@ -1281,7 +1311,7 @@ const acts = {
   },
   async 'adm-toggle'(t) {
     const b = byId(t.dataset.id), f = t.dataset.f;
-    if (f === 'featured' && !b.featured && DB.all.filter(x => x.featured).length >= C.featuredSlots) return toast(`All ${C.featuredSlots} feature slots are taken. Free one up first.`);
+    if (f === 'featured' && !b.featured && DB.all.filter(x => x.featured).length >= C.featuredSlots) return toast(`You can pin up to ${C.featuredSlots}. Unpin one first. The rest rotate automatically.`);
     await api.updateBiz(b.id, { [f]: !b[f] }); await refresh();
   },
   async 'adm-delete'(t) {

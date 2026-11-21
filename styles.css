@@ -457,3 +457,22 @@ a.note:hover { border-color: var(--accent-text); }
 .g-icon { width: 52px; height: 52px; border-radius: 12px; background: var(--card, #fff); border: 2px solid var(--line, #d6d3c8); display: grid; place-items: center; color: #0A7AFF; }
 .g-blank { border-style: dashed; }
 .g-step svg.inl { vertical-align: -3px; color: #0A7AFF; }
+
+/* ---- fading photos (feature cards, thumbnails, profile header) ---- */
+.plaque.rot { position: relative; }
+.plaque.rot img { position: absolute; inset: 0; opacity: 0; transition: opacity .9s ease; }
+.plaque.rot img.on { opacity: 1; }
+/* ---- big profile photo that fades through all uploads ---- */
+.shots { position: relative; height: 240px; margin: 0 -20px 20px; background: var(--green-deep, #0e241b); overflow: hidden; }
+.shots img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0; transition: opacity 1s ease; }
+.shots img.on { opacity: 1; }
+.shots-dots { position: absolute; left: 0; right: 0; bottom: 10px; display: flex; gap: 6px; justify-content: center; z-index: 2; }
+.shots-dots i { width: 7px; height: 7px; border-radius: 50%; background: rgba(255,255,255,.45); }
+.shots-dots i.on { background: #fff; }
+@media (min-width: 680px) { .shots { border-radius: 10px; margin: 0 0 20px; height: 300px; } }
+@media (prefers-reduced-motion: reduce) { .plaque.rot img, .shots img { transition: none; } }
+
+/* ---- account help buttons: stack neatly with room to breathe ---- */
+.help-acts { display: flex; flex-direction: column; gap: 10px; align-items: stretch; margin-top: 14px; }
+.help-acts .btn { width: 100%; }
+@media (min-width: 560px) { .help-acts { flex-direction: row; flex-wrap: wrap; } .help-acts .btn { width: auto; } }
