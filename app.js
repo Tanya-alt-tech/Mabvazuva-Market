@@ -1398,13 +1398,13 @@ window.addEventListener('hashchange', () => render());
     if (RECOVERY) clean('#/reset');
     else if (LINK_ERROR) clean('#/forgot?expired=1');
     if (LIVE) {
-      await api.session();           // quick, mostly local: gets the shell and menu right
-      render();                      // show the page now, before the slow part
       DB.loading = true;
-      await api.load();              // the slow part: fetch businesses etc.
+      render();                      // paint the page at once, before any network call
+      await api.session();           // who is signed in (may be a slow round trip)
+      await api.load();              // fetch businesses etc.
       DB.loading = false;
       if (ME.user) pushResync(false);
-      render(true);                  // fill in the real data
+      render(true);                  // fill in the real data and the right menu
     } else {
       await api.session(); await api.load(); render();
     }
